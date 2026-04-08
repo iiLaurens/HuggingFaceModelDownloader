@@ -59,6 +59,22 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
+// countingReader wraps an io.Reader and atomically increments a counter by
+// the number of bytes read. Used to track in-flight download bytes across
+// multiple concurrent workers without holding any locks.
+type countingReader struct {
+	r       io.Reader
+	counter *int64
+}
+
+func (cr *countingReader) Read(p []byte) (n int, err error) {
+	n, err = cr.r.Read(p)
+	if n > 0 {
+		atomic.AddInt64(cr.counter, int64(n))
+	}
+	return
+}
+
 // Download scans and downloads files from a HuggingFace repo.
 //
 // v3.0+: Files are stored in HuggingFace Hub cache structure by default:
@@ -123,6 +139,14 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	thresholdBytes, err := parseSizeString(cfg.MultipartThreshold, 256<<20)
 	if err != nil {
 		return fmt.Errorf("invalid multipart-threshold: %w", err)
+	}
+
+	partSize, err := parseSizeString(cfg.PartSize, 32<<20)
+	if err != nil {
+		return fmt.Errorf("invalid part-size: %w", err)
+	}
+	if partSize < 1<<20 {
+		partSize = 1 << 20 // floor at 1 MiB to avoid degenerate behaviour
 	}
 
 	httpc := buildHTTPClientWithProxy(cfg.Proxy)
@@ -306,7 +330,7 @@ LOOP:
 			var computedSHA string
 			var dlErr error
 			if it.Size >= thresholdBytes && it.AcceptRanges {
-				computedSHA, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+				computedSHA, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit, partSize)
 			} else {
 				computedSHA, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
 			}
@@ -496,14 +520,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	return "", lastErr
 }
 
-// multipartPartSize is the size of each in-memory part for parallel downloads.
-// Smaller parts mean lower peak memory per worker and finer-grained progress,
-// while still being large enough to amortise per-request overhead.
-const multipartPartSize = 8 * 1024 * 1024 // 8 MiB
-
-// fetchPart downloads a single byte range and returns its bytes.
-// It retries according to cfg on transient errors.
-func fetchPart(ctx context.Context, httpc *http.Client, token string, it PlanItem, start, end int64, cfg Settings, emit func(ProgressEvent)) ([]byte, error) {
+// fetchPart downloads a single byte range, returns its bytes, and increments
+// networkBytes atomically as each chunk arrives — allowing a ticker goroutine
+// to report real-time progress across all concurrent workers.
+func fetchPart(ctx context.Context, httpc *http.Client, token string, it PlanItem, start, end int64, cfg Settings, emit func(ProgressEvent), networkBytes *int64) ([]byte, error) {
 	retry := newRetry(cfg)
 	var lastErr error
 	for attempt := 0; attempt <= cfg.Retries; attempt++ {
@@ -522,7 +542,7 @@ func fetchPart(ctx context.Context, httpc *http.Client, token string, it PlanIte
 			lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
 			rs.Body.Close()
 		} else {
-			data, err := io.ReadAll(rs.Body)
+			data, err := io.ReadAll(&countingReader{r: rs.Body, counter: networkBytes})
 			rs.Body.Close()
 			if err == nil {
 				return data, nil
@@ -541,11 +561,18 @@ func fetchPart(ctx context.Context, httpc *http.Client, token string, it PlanIte
 
 // downloadMultipart downloads a file using parallel range requests.
 //
-// Each part is fetched into memory by a pool of cfg.Concurrency workers.
-// A sequential writer consumes the results in part-index order, writing
-// directly to dst without any intermediate per-part temp files on disk.
-// The SHA-256 hash is computed during that single write pass.
-func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) (string, error) {
+// Parts are sized according to partSize and fetched into memory by a pool of
+// cfg.Concurrency workers. Peak in-memory data is capped at 512 MiB
+// regardless of partSize — on very large parts the semaphore automatically
+// reduces concurrency to stay within that limit.
+//
+// A sequential writer consumes parts in index order, piping each directly
+// to the output file while computing the SHA-256 hash in the same pass.
+// No per-part temp files are created on disk.
+//
+// A 200 ms ticker reports real-time download progress as bytes arrive from
+// the network, independent of how fast the writer flushes them to disk.
+func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent), partSize int64) (string, error) {
 	// HEAD to resolve size and confirm range support.
 	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
 	addAuth(req, token)
@@ -566,11 +593,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
 	}
 
-	numParts := int((it.Size + multipartPartSize - 1) / multipartPartSize)
+	numParts := int((it.Size + partSize - 1) / partSize)
 
 	type partResult struct {
-		data []byte
-		err  error
+		data        []byte
+		err         error
+		semAcquired bool // true when worker acquired a sem slot before fetching
 	}
 	// One buffered slot per part so a completed worker never blocks waiting
 	// for the sequential writer to catch up.
@@ -580,17 +608,44 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	}
 
 	// Inner context cancelled when the writer stops (on error or after the
-	// last part), which causes in-flight HTTP requests to be aborted.
+	// last part), which aborts in-flight HTTP requests promptly.
 	dlCtx, dlCancel := context.WithCancel(ctx)
 	defer dlCancel()
 
+	// sem bounds how many parts can have their data in memory at once.
+	// Workers acquire a slot before calling fetchPart; the writer releases
+	// it after consuming (writing) the part's data.
+	// The ceiling is cfg.Concurrency*2 slots OR however many fit in 512 MiB —
+	// whichever is smaller — so peak RAM stays predictable regardless of partSize.
+	// On cancellation the worker skips acquisition and sends an error
+	// result instead (semAcquired=false), so the writer never releases for it.
+	const maxInFlightMemory = 512 * 1024 * 1024 // 512 MiB hard cap
+	maxInFlight := cfg.Concurrency * 2
+	if memCap := int(maxInFlightMemory / partSize); memCap < maxInFlight {
+		maxInFlight = memCap
+	}
+	if maxInFlight < 1 {
+		maxInFlight = 1
+	}
+	if maxInFlight > numParts {
+		maxInFlight = numParts
+	}
+	sem := make(chan struct{}, maxInFlight)
+
+	// networkBytes is incremented atomically by countingReader inside fetchPart
+	// as bytes arrive off the wire. The progress ticker below reads it.
+	var networkBytes int64
+
 	// Work queue pre-filled with all parts, then closed so workers exit
-	// naturally when the queue is empty.
-	type workItem struct{ idx int; start, end int64 }
+	// naturally once the queue is empty.
+	type workItem struct {
+		idx        int
+		start, end int64
+	}
 	workCh := make(chan workItem, numParts)
 	for i := 0; i < numParts; i++ {
-		start := int64(i) * multipartPartSize
-		end := start + multipartPartSize - 1
+		start := int64(i) * partSize
+		end := start + partSize - 1
 		if end >= it.Size {
 			end = it.Size - 1
 		}
@@ -598,8 +653,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	}
 	close(workCh)
 
-	// Launch a fixed-size worker pool — at most cfg.Concurrency goroutines
-	// running simultaneously, each fetching one part at a time.
+	// Fixed-size worker pool: at most cfg.Concurrency goroutines running at once.
 	workers := cfg.Concurrency
 	if workers > numParts {
 		workers = numParts
@@ -610,13 +664,44 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		go func() {
 			defer dlWg.Done()
 			for wi := range workCh {
-				data, err := fetchPart(dlCtx, httpc, token, it, wi.start, wi.end, cfg, emit)
-				results[wi.idx] <- partResult{data, err}
+				// Acquire a memory slot before fetching.
+				// On cancellation: send an error immediately (semAcquired=false)
+				// and continue draining workCh so every channel gets exactly one
+				// send — the writer won't deadlock waiting for a result.
+				select {
+				case sem <- struct{}{}:
+				case <-dlCtx.Done():
+					results[wi.idx] <- partResult{nil, dlCtx.Err(), false}
+					continue
+				}
+				data, err := fetchPart(dlCtx, httpc, token, it, wi.start, wi.end, cfg, emit, &networkBytes)
+				results[wi.idx] <- partResult{data, err, true}
 			}
 		}()
 	}
 
-	// Sequential writer: consume results in index order and pipe to disk + hasher.
+	// Progress ticker: emit file_progress events as bytes stream in from the
+	// network. This runs independently of the writer, giving smooth feedback
+	// even while large parts are still being fetched.
+	go func() {
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-dlCtx.Done():
+				return
+			case <-t.C:
+				emit(ProgressEvent{
+					Event:      "file_progress",
+					Path:       it.RelativePath,
+					Downloaded: atomic.LoadInt64(&networkBytes),
+					Total:      it.Size,
+				})
+			}
+		}
+	}()
+
+	// Sequential writer: consume results in index order, pipe to dst + hasher.
 	out, err := os.Create(dst + ".part")
 	if err != nil {
 		dlCancel()
@@ -626,10 +711,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 	h := sha256.New()
 	mw := io.MultiWriter(out, h)
-	var written int64
 	var writeErr error
 	for i := 0; i < numParts; i++ {
 		res := <-results[i]
+		if res.semAcquired {
+			<-sem // release slot: this part's data is about to be consumed/freed
+		}
 		if res.err != nil {
 			writeErr = res.err
 			dlCancel()
@@ -640,9 +727,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			dlCancel()
 			break
 		}
-		written += int64(len(res.data))
 		res.data = nil // allow GC of the chunk
-		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: written, Total: it.Size})
 	}
 	out.Close()
 	dlWg.Wait()
@@ -651,6 +736,15 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		_ = os.Remove(dst + ".part")
 		return "", writeErr
 	}
+
+	// Emit one final progress event so the UI always reaches 100% received,
+	// even on very fast connections where the 200ms ticker never fired.
+	emit(ProgressEvent{
+		Event:      "file_progress",
+		Path:       it.RelativePath,
+		Downloaded: atomic.LoadInt64(&networkBytes),
+		Total:      it.Size,
+	})
 
 	computedSHA := hex.EncodeToString(h.Sum(nil))
 	if err := os.Rename(dst+".part", dst); err != nil {
