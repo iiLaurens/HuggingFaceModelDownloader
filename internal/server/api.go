@@ -1402,7 +1402,7 @@ func (s *Server) handleCacheDeleteFiles(w http.ResponseWriter, r *http.Request) 
 		if m.TotalSize < 0 {
 			m.TotalSize = 0
 		}
-		_ = m.Write(friendlyBase)
+		_, _ = m.Write(friendlyBase)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
