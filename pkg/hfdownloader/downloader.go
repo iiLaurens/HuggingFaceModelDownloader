@@ -496,10 +496,57 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	return "", lastErr
 }
 
-// downloadMultipart downloads a file using multiple parallel range requests
-// and returns the SHA-256 hash computed during the sequential assembly pass.
+// multipartPartSize is the size of each in-memory part for parallel downloads.
+// Smaller parts mean lower peak memory per worker and finer-grained progress,
+// while still being large enough to amortise per-request overhead.
+const multipartPartSize = 8 * 1024 * 1024 // 8 MiB
+
+// fetchPart downloads a single byte range and returns its bytes.
+// It retries according to cfg on transient errors.
+func fetchPart(ctx context.Context, httpc *http.Client, token string, it PlanItem, start, end int64, cfg Settings, emit func(ProgressEvent)) ([]byte, error) {
+	retry := newRetry(cfg)
+	var lastErr error
+	for attempt := 0; attempt <= cfg.Retries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		rq, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
+		addAuth(rq, token)
+		rq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+		rs, err := httpc.Do(rq)
+		if err != nil {
+			lastErr = err
+		} else if rs.StatusCode != 206 {
+			lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
+			rs.Body.Close()
+		} else {
+			data, err := io.ReadAll(rs.Body)
+			rs.Body.Close()
+			if err == nil {
+				return data, nil
+			}
+			lastErr = err
+		}
+		if attempt < cfg.Retries {
+			emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
+			if d := retry.Next(); !sleepCtx(ctx, d) {
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+// downloadMultipart downloads a file using parallel range requests.
+//
+// Each part is fetched into memory by a pool of cfg.Concurrency workers.
+// A sequential writer consumes the results in part-index order, writing
+// directly to dst without any intermediate per-part temp files on disk.
+// The SHA-256 hash is computed during that single write pass.
 func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) (string, error) {
-	// HEAD to resolve size
+	// HEAD to resolve size and confirm range support.
 	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
 	addAuth(req, token)
 	resp, err := httpc.Do(req)
@@ -519,152 +566,95 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
 	}
 
-	// Plan parts
-	n := cfg.Concurrency
-	chunk := it.Size / int64(n)
-	if chunk <= 0 {
-		chunk = it.Size
-		n = 1
+	numParts := int((it.Size + multipartPartSize - 1) / multipartPartSize)
+
+	type partResult struct {
+		data []byte
+		err  error
+	}
+	// One buffered slot per part so a completed worker never blocks waiting
+	// for the sequential writer to catch up.
+	results := make([]chan partResult, numParts)
+	for i := range results {
+		results[i] = make(chan partResult, 1)
 	}
 
-	tmpParts := make([]string, n)
-	for i := 0; i < n; i++ {
-		tmpParts[i] = fmt.Sprintf("%s.part-%02d", dst, i)
-	}
+	// Inner context cancelled when the writer stops (on error or after the
+	// last part), which causes in-flight HTTP requests to be aborted.
+	dlCtx, dlCancel := context.WithCancel(ctx)
+	defer dlCancel()
 
-	// Download parts in parallel
-	var wg sync.WaitGroup
-	errCh := make(chan error, n)
-
-	for i := 0; i < n; i++ {
-		i := i
-		start := int64(i) * chunk
-		end := start + chunk - 1
-		if i == n-1 {
+	// Work queue pre-filled with all parts, then closed so workers exit
+	// naturally when the queue is empty.
+	type workItem struct{ idx int; start, end int64 }
+	workCh := make(chan workItem, numParts)
+	for i := 0; i < numParts; i++ {
+		start := int64(i) * multipartPartSize
+		end := start + multipartPartSize - 1
+		if end >= it.Size {
 			end = it.Size - 1
 		}
+		workCh <- workItem{i, start, end}
+	}
+	close(workCh)
 
-		wg.Add(1)
+	// Launch a fixed-size worker pool — at most cfg.Concurrency goroutines
+	// running simultaneously, each fetching one part at a time.
+	workers := cfg.Concurrency
+	if workers > numParts {
+		workers = numParts
+	}
+	var dlWg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		dlWg.Add(1)
 		go func() {
-			defer wg.Done()
-			tmp := tmpParts[i]
-
-			// Resume: skip if already correct size
-			if fi, err := os.Stat(tmp); err == nil && fi.Size() == (end-start+1) {
-				return
-			}
-
-			retry := newRetry(cfg)
-			var lastErr error
-
-			for attempt := 0; attempt <= cfg.Retries; attempt++ {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-
-				rq, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
-				addAuth(rq, token)
-				rq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-				rs, err := httpc.Do(rq)
-				if err != nil {
-					lastErr = err
-				} else if rs.StatusCode != 206 {
-					lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
-					rs.Body.Close()
-				} else {
-					out, err := os.Create(tmp)
-					if err != nil {
-						lastErr = err
-						rs.Body.Close()
-					} else {
-						_, lastErr = io.Copy(out, rs.Body)
-						out.Close()
-					rs.Body.Close()
-					if lastErr == nil {
-						return
-					}
-				}
-				}
-
-				if attempt < cfg.Retries {
-					emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
-					if d := retry.Next(); !sleepCtx(ctx, d) {
-						return
-					}
-				}
-			}
-
-			select {
-			case errCh <- lastErr:
-			default:
+			defer dlWg.Done()
+			for wi := range workCh {
+				data, err := fetchPart(dlCtx, httpc, token, it, wi.start, wi.end, cfg, emit)
+				results[wi.idx] <- partResult{data, err}
 			}
 		}()
 	}
 
-	// Emit periodic progress
-	go func() {
-		t := time.NewTicker(200 * time.Millisecond) // More frequent updates for responsive UI
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				var downloaded int64
-				for _, p := range tmpParts {
-					if fi, err := os.Stat(p); err == nil {
-						downloaded += fi.Size()
-					}
-				}
-				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: downloaded, Total: it.Size})
-			}
-		}
-	}()
-
-	wg.Wait()
-
-	select {
-	case e := <-errCh:
-		return "", e
-	default:
-	}
-
-	// Assemble parts, computing the SHA-256 incrementally as we stream each
-	// chunk into the combined file — no extra read of the file is needed.
+	// Sequential writer: consume results in index order and pipe to disk + hasher.
 	out, err := os.Create(dst + ".part")
 	if err != nil {
+		dlCancel()
+		dlWg.Wait()
 		return "", err
 	}
 
 	h := sha256.New()
-	for i := 0; i < n; i++ {
-		p := tmpParts[i]
-		in, err := os.Open(p)
-		if err != nil {
-			out.Close()
-			return "", err
+	mw := io.MultiWriter(out, h)
+	var written int64
+	var writeErr error
+	for i := 0; i < numParts; i++ {
+		res := <-results[i]
+		if res.err != nil {
+			writeErr = res.err
+			dlCancel()
+			break
 		}
-		if _, err := io.Copy(io.MultiWriter(out, h), in); err != nil {
-			in.Close()
-			out.Close()
-			return "", err
+		if _, err := mw.Write(res.data); err != nil {
+			writeErr = err
+			dlCancel()
+			break
 		}
-		in.Close()
+		written += int64(len(res.data))
+		res.data = nil // allow GC of the chunk
+		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: written, Total: it.Size})
 	}
 	out.Close()
+	dlWg.Wait()
+
+	if writeErr != nil {
+		_ = os.Remove(dst + ".part")
+		return "", writeErr
+	}
 
 	computedSHA := hex.EncodeToString(h.Sum(nil))
-
 	if err := os.Rename(dst+".part", dst); err != nil {
 		return "", err
 	}
-
-	for _, p := range tmpParts {
-		_ = os.Remove(p)
-	}
-
 	return computedSHA, nil
 }
