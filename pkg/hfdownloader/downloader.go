@@ -5,6 +5,8 @@ package hfdownloader
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -301,11 +303,12 @@ LOOP:
 			itForIO.RelativePath = finalRel
 
 			// Choose single/multipart path
+			var computedSHA string
 			var dlErr error
 			if it.Size >= thresholdBytes && it.AcceptRanges {
-				dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+				computedSHA, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
 			} else {
-				dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+				computedSHA, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
 			}
 			if dlErr != nil {
 				select {
@@ -315,11 +318,12 @@ LOOP:
 				return
 			}
 
-			// Verify after download
+			// Verify after download — use the hash computed during streaming to
+			// avoid a full second read of the file.
 			if it.LFS && it.SHA256 != "" {
-				if err := verifySHA256(dst, it.SHA256); err != nil {
+				if !strings.EqualFold(computedSHA, it.SHA256) {
 					select {
-					case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
+					case errCh <- fmt.Errorf("sha256 verify failed: %s: expected %s got %s", finalRel, it.SHA256, computedSHA):
 					default:
 					}
 					return
@@ -335,22 +339,20 @@ LOOP:
 				}
 			} else if cfg.Verify == "sha256" {
 				_, remoteSha, _ := headForETag(fileCtx, httpc, cfg.Token, itForIO)
-				if remoteSha != "" {
-					if err := verifySHA256(dst, remoteSha); err != nil {
-						select {
-						case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
-						default:
-						}
-						return
+				if remoteSha != "" && !strings.EqualFold(computedSHA, remoteSha) {
+					select {
+					case errCh <- fmt.Errorf("sha256 verify failed: %s: expected %s got %s", finalRel, remoteSha, computedSHA):
+					default:
 					}
+					return
 				}
 			}
 
-			// For HF Cache mode: move to blob and create symlinks
+			// For HF Cache mode: move to blob and create symlinks.
+			// Pass computedSHA so StoreDownloadedFile skips its own re-read.
 			var finalSHA256 string
 			if useHFCache {
-				sha := it.SHA256
-				result, err := repoDir.StoreDownloadedFile(dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
+				result, err := repoDir.StoreDownloadedFile(dst, it.RelativePath, plan.Commit, computedSHA, filterSubdir, cfg.NoFriendlyView)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -435,14 +437,10 @@ LOOP:
 	return nil
 }
 
-// downloadSingle downloads a file in a single request.
-func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
+// downloadSingle downloads a file in a single request and returns the
+// SHA-256 hash computed incrementally during the download.
+func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) (string, error) {
 	tmp := dst + ".part"
-	out, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
 
 	retry := newRetry(cfg)
 	var lastErr error
@@ -450,7 +448,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	for attempt := 0; attempt <= cfg.Retries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		default:
 		}
 
@@ -465,13 +463,24 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				lastErr = fmt.Errorf("bad status: %s", resp.Status)
 				resp.Body.Close()
 			} else {
-				// Use progress reader to emit periodic updates
+				// Create/truncate the .part file fresh for each attempt so that
+				// a partial write from a failed attempt doesn't corrupt the retry.
+				out, err := os.Create(tmp)
+				if err != nil {
+					resp.Body.Close()
+					return "", err
+				}
+
+				h := sha256.New()
 				pr := newProgressReader(resp.Body, it.Size, it.RelativePath, emit)
-				_, cerr := io.Copy(out, pr)
+				_, cerr := io.Copy(io.MultiWriter(out, h), pr)
+				out.Close()
 				resp.Body.Close()
 				if cerr == nil {
-					out.Close()
-					return os.Rename(tmp, dst)
+					if err := os.Rename(tmp, dst); err != nil {
+						return "", err
+					}
+					return hex.EncodeToString(h.Sum(nil)), nil
 				}
 				lastErr = cerr
 			}
@@ -480,21 +489,22 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		if attempt < cfg.Retries {
 			emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
 			if d := retry.Next(); !sleepCtx(ctx, d) {
-				return ctx.Err()
+				return "", ctx.Err()
 			}
 		}
 	}
-	return lastErr
+	return "", lastErr
 }
 
-// downloadMultipart downloads a file using multiple parallel range requests.
-func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
+// downloadMultipart downloads a file using multiple parallel range requests
+// and returns the SHA-256 hash computed during the sequential assembly pass.
+func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) (string, error) {
 	// HEAD to resolve size
 	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
 	addAuth(req, token)
 	resp, err := httpc.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	resp.Body.Close()
 
@@ -618,39 +628,43 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 	select {
 	case e := <-errCh:
-		return e
+		return "", e
 	default:
 	}
 
-	// Assemble parts
+	// Assemble parts, computing the SHA-256 incrementally as we stream each
+	// chunk into the combined file — no extra read of the file is needed.
 	out, err := os.Create(dst + ".part")
 	if err != nil {
-		return err
+		return "", err
 	}
 
+	h := sha256.New()
 	for i := 0; i < n; i++ {
 		p := tmpParts[i]
 		in, err := os.Open(p)
 		if err != nil {
 			out.Close()
-			return err
+			return "", err
 		}
-		if _, err := io.Copy(out, in); err != nil {
+		if _, err := io.Copy(io.MultiWriter(out, h), in); err != nil {
 			in.Close()
 			out.Close()
-			return err
+			return "", err
 		}
 		in.Close()
 	}
 	out.Close()
 
+	computedSHA := hex.EncodeToString(h.Sum(nil))
+
 	if err := os.Rename(dst+".part", dst); err != nil {
-		return err
+		return "", err
 	}
 
 	for _, p := range tmpParts {
 		_ = os.Remove(p)
 	}
 
-	return nil
+	return computedSHA, nil
 }
