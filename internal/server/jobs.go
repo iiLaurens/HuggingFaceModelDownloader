@@ -33,6 +33,7 @@ type Job struct {
 	IsDataset bool              `json:"isDataset,omitempty"`
 	Filters   []string          `json:"filters,omitempty"`
 	Excludes  []string          `json:"excludes,omitempty"`
+	Paths     []string          `json:"paths,omitempty"`
 	OutputDir string            `json:"outputDir"`
 	Status    JobStatus         `json:"status"`
 	Progress  JobProgress       `json:"progress"`
@@ -122,6 +123,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		IsDataset: req.Dataset,
 		Filters:   req.Filters,
 		Excludes:  req.Excludes,
+		Paths:     req.Paths,
 		OutputDir: cacheDir, // HuggingFace cache directory
 		Status:    JobStatusQueued,
 		CreatedAt: time.Now(),
@@ -315,6 +317,7 @@ func (m *JobManager) runJob(job *Job) {
 		IsDataset:          job.IsDataset,
 		Filters:            job.Filters,
 		Excludes:           job.Excludes,
+		Paths:              job.Paths,
 		AppendFilterSubdir: false,
 	}
 
