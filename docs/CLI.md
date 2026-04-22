@@ -140,7 +140,8 @@ hfdownloader [REPO] [flags]              # Same as above
 
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
-| `--cache-dir` | | string | `~/.cache/huggingface` | Cache directory |
+| `--cache-dir` | | string | `~/.cache/huggingface` | HF cache directory (default layout) |
+| `--local-dir` | | string | | Download real files (not HF cache symlinks) into this directory, `huggingface-cli`-style |
 | `--endpoint` | | string | `https://huggingface.co` | Custom endpoint (mirrors) |
 | `--no-manifest` | | bool | `false` | Don't write hfd.yaml manifest |
 | `--no-friendly` | | bool | `false` | Don't create friendly symlinks |
@@ -156,12 +157,21 @@ hfdownloader [REPO] [flags]              # Same as above
 | `--proxy-pass` | | string | | Proxy authentication password |
 | `--no-env-proxy` | | bool | `false` | Ignore HTTP_PROXY/HTTPS_PROXY env vars |
 
-#### Legacy Mode (v2.x compatibility)
+#### Flat-file output (v2.x compatibility)
+
+Use these when you want real files at a user-specified path instead of the
+HF cache's blobs + symlink layout. `--local-dir` is the preferred, non-legacy
+name; `--legacy -o <dir>` continues to work for v2.x users and is not going
+away.
 
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
-| `--legacy` | | bool | `false` | Use flat directory structure |
-| `--output` | `-o` | string | | Output directory (legacy only) |
+| `--local-dir` | | string | | Flat-file mode; download real files into this directory |
+| `--legacy` | | bool | `false` | Enable v2.x flat directory structure (defaults to `Models/` or `Datasets/`) |
+| `--output` | `-o` | string | | Output directory for `--legacy` mode |
+
+`--local-dir <path>` and `--legacy -o <path>` are equivalent. They are
+mutually exclusive on a single command line.
 
 #### Examples
 
@@ -206,6 +216,11 @@ hfdownloader download owner/repo --proxy http://proxy:8080
 # Download via authenticated SOCKS5 proxy
 hfdownloader download owner/repo --proxy socks5://localhost:1080 \
   --proxy-user myuser --proxy-pass mypassword
+
+# Put real files (not HF cache symlinks) in a directory of your choice
+hfdownloader download owner/repo --local-dir ./my-model
+# Equivalent v2.x form (still supported)
+hfdownloader download owner/repo --legacy -o ./my-model
 ```
 
 ---
@@ -830,7 +845,7 @@ hfdownloader version [flags]
 
 ```bash
 hfdownloader version
-# hfdownloader v3.0.3
+# hfdownloader v3.0.4
 # Go:      go1.21.0
 # OS/Arch: darwin/arm64
 # Commit:  abc123

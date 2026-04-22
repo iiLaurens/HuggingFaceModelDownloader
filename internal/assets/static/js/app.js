@@ -844,6 +844,148 @@
     }
   }
 
+  // Per-job DOM element cache. renderJobs() used to rebuild innerHTML on
+  // every WebSocket progress event, which destroyed every element under
+  // the cursor ~4 times per second — hover states flickered, and buttons
+  // lost pointerdown/pointerup continuity mid-click. Now we keep stable
+  // elements keyed by job ID and only mutate the fields that actually
+  // changed. Buttons are only re-rendered when the status category
+  // transitions (e.g. running→paused), not on every progress tick.
+  const jobCardCache = new Map();
+
+  // statusCategory groups statuses that share the same action buttons so
+  // we only swap the buttons when the category changes. Running / queued
+  // both show Cancel; paused has Resume+Cancel; terminal states show Dismiss.
+  function statusCategory(status) {
+    if (status === 'running' || status === 'queued') return 'active';
+    if (status === 'paused') return 'paused';
+    if (status === 'completed' || status === 'failed' || status === 'cancelled') return 'done';
+    return status || 'unknown';
+  }
+
+  function actionButtonsHTML(job) {
+    const id = escapeHtml(job.id);
+    const status = job.status || 'queued';
+    if (status === 'running') {
+      return `
+          <button class="btn btn-sm btn-warning" onclick="pauseJob('${id}')">Pause</button>
+          <button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>
+      `;
+    }
+    if (status === 'paused') {
+      return `
+          <button class="btn btn-sm btn-primary" onclick="resumeJob('${id}')">Resume</button>
+          <button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>
+      `;
+    }
+    if (status === 'queued') {
+      return `<button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>`;
+    }
+    // completed / failed / cancelled
+    return `<button class="btn btn-sm btn-secondary" onclick="dismissJob('${id}')">Dismiss</button>`;
+  }
+
+  function createJobCard(job) {
+    const el = document.createElement('div');
+    el.className = 'job-card';
+    el.dataset.jobId = job.id;
+    el.innerHTML = `
+        <div class="job-header">
+          <div>
+            <div class="job-repo"></div>
+            <div class="job-revision" style="font-size: 13px; color: var(--color-text-muted);"></div>
+          </div>
+          <div class="job-header-right">
+            <span class="job-status" data-role="status"></span>
+            <span class="job-actions" data-role="actions"></span>
+          </div>
+        </div>
+        <div class="job-progress">
+          <div class="progress-bar">
+            <div class="progress-fill" data-role="fill" style="width: 0%"></div>
+          </div>
+        </div>
+        <div class="job-stats">
+          <span data-role="pct">0.0%</span>
+          <span data-role="speed" style="display: none"></span>
+          <span data-role="bytes"></span>
+          <span data-role="files"></span>
+        </div>
+        <div class="job-error" data-role="error" style="display: none"></div>
+    `;
+    // Static fields (set once, never changed by progress events).
+    el.querySelector('.job-repo').textContent = job.repo || '';
+    el.querySelector('.job-revision').textContent = job.revision || 'main';
+    return el;
+  }
+
+  // updateJobCard mutates an existing card in place. It reads textContent
+  // before writing so we avoid forcing the browser to recompute styles for
+  // values that didn't actually change — keeps the DOM stable for hover.
+  function updateJobCard(el, job) {
+    const p = job.progress || {};
+    const totalBytes = p.totalBytes || 0;
+    const downloadedBytes = p.downloadedBytes || 0;
+    const pct = totalBytes > 0 ? (downloadedBytes / totalBytes * 100) : 0;
+    const speed = p.bytesPerSecond || 0;
+    const status = job.status || 'queued';
+
+    // Status badge.
+    const statusEl = el.querySelector('[data-role="status"]');
+    if (statusEl.textContent !== status) {
+      statusEl.textContent = status;
+      statusEl.className = 'job-status ' + status;
+    }
+
+    // Action buttons — only swap when the category changes, to avoid
+    // killing the button the user is about to click or is currently
+    // hovering. Within a single status category the DOM stays identical.
+    const newCat = statusCategory(status);
+    if (el.dataset.statusCategory !== newCat) {
+      el.dataset.statusCategory = newCat;
+      el.querySelector('[data-role="actions"]').innerHTML = actionButtonsHTML(job);
+    }
+
+    // Progress bar.
+    const fillEl = el.querySelector('[data-role="fill"]');
+    const nextWidth = pct + '%';
+    if (fillEl.style.width !== nextWidth) {
+      fillEl.style.width = nextWidth;
+    }
+
+    // Stats.
+    const pctText = pct.toFixed(1) + '%';
+    const pctEl = el.querySelector('[data-role="pct"]');
+    if (pctEl.textContent !== pctText) pctEl.textContent = pctText;
+
+    const speedEl = el.querySelector('[data-role="speed"]');
+    if (speed > 0) {
+      const speedText = formatBytes(speed) + '/s';
+      if (speedEl.textContent !== speedText) speedEl.textContent = speedText;
+      if (speedEl.style.display === 'none') speedEl.style.display = '';
+    } else {
+      if (speedEl.style.display !== 'none') speedEl.style.display = 'none';
+    }
+
+    const bytesText = formatBytes(downloadedBytes) + ' / ' + formatBytes(totalBytes);
+    const bytesEl = el.querySelector('[data-role="bytes"]');
+    if (bytesEl.textContent !== bytesText) bytesEl.textContent = bytesText;
+
+    const filesText = (p.completedFiles || 0) + ' / ' + (p.totalFiles || 0) + ' files';
+    const filesEl = el.querySelector('[data-role="files"]');
+    if (filesEl.textContent !== filesText) filesEl.textContent = filesText;
+
+    // Error.
+    const errorEl = el.querySelector('[data-role="error"]');
+    if (job.error) {
+      if (errorEl.textContent !== job.error) errorEl.textContent = job.error;
+      if (errorEl.style.display === 'none') errorEl.style.display = '';
+    } else if (errorEl.style.display !== 'none') {
+      errorEl.style.display = 'none';
+      errorEl.textContent = '';
+    }
+  }
+
   function renderJobs() {
     const container = $('#jobsList');
     if (!container) return;
@@ -862,67 +1004,36 @@
           <p>Start a download from the Download page to see progress here.</p>
         </div>
       `;
+      jobCardCache.clear();
       return;
     }
 
-    container.innerHTML = jobs.map(job => {
-      const p = job.progress || {};
-      const totalBytes = p.totalBytes || 0;
-      const downloadedBytes = p.downloadedBytes || 0;
-      const progress = totalBytes > 0 ? (downloadedBytes / totalBytes * 100) : 0;
-      const speed = p.bytesPerSecond || 0;
-      const status = job.status || 'queued';
+    // If we're transitioning from the empty-state template back into
+    // the jobs view, clear the container and cache first.
+    if (container.querySelector('.empty-state')) {
+      container.innerHTML = '';
+      jobCardCache.clear();
+    }
 
-      // Determine which action buttons to show
-      const isRunning = status === 'running';
-      const isQueued = status === 'queued';
-      const isPaused = status === 'paused';
-      const isDone = status === 'completed' || status === 'failed' || status === 'cancelled';
-
-      let actionButtons = '';
-      if (isRunning) {
-        actionButtons = `
-          <button class="btn btn-sm btn-warning" onclick="pauseJob('${escapeHtml(job.id)}')">Pause</button>
-          <button class="btn btn-sm btn-danger" onclick="cancelJob('${escapeHtml(job.id)}')">Cancel</button>
-        `;
-      } else if (isPaused) {
-        actionButtons = `
-          <button class="btn btn-sm btn-primary" onclick="resumeJob('${escapeHtml(job.id)}')">Resume</button>
-          <button class="btn btn-sm btn-danger" onclick="cancelJob('${escapeHtml(job.id)}')">Cancel</button>
-        `;
-      } else if (isQueued) {
-        actionButtons = `<button class="btn btn-sm btn-danger" onclick="cancelJob('${escapeHtml(job.id)}')">Cancel</button>`;
-      } else if (isDone) {
-        actionButtons = `<button class="btn btn-sm btn-secondary" onclick="dismissJob('${escapeHtml(job.id)}')">Dismiss</button>`;
+    const seen = new Set();
+    for (const job of jobs) {
+      seen.add(job.id);
+      let el = jobCardCache.get(job.id);
+      if (!el) {
+        el = createJobCard(job);
+        jobCardCache.set(job.id, el);
+        container.appendChild(el);
       }
+      updateJobCard(el, job);
+    }
 
-      return `
-        <div class="job-card">
-          <div class="job-header">
-            <div>
-              <div class="job-repo">${escapeHtml(job.repo)}</div>
-              <div style="font-size: 13px; color: var(--color-text-muted);">${escapeHtml(job.revision || 'main')}</div>
-            </div>
-            <div class="job-header-right">
-              <span class="job-status ${status}">${status}</span>
-              ${actionButtons}
-            </div>
-          </div>
-          <div class="job-progress">
-            <div class="progress-bar">
-              <div class="progress-fill" style="width: ${progress}%"></div>
-            </div>
-          </div>
-          <div class="job-stats">
-            <span>${progress.toFixed(1)}%</span>
-            ${speed > 0 ? `<span>${formatBytes(speed)}/s</span>` : ''}
-            <span>${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}</span>
-            <span>${p.completedFiles || 0} / ${p.totalFiles || 0} files</span>
-          </div>
-          ${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ''}
-        </div>
-      `;
-    }).join('');
+    // Remove stale cards for jobs that are no longer tracked (dismiss).
+    for (const [id, el] of jobCardCache) {
+      if (!seen.has(id)) {
+        el.remove();
+        jobCardCache.delete(id);
+      }
+    }
   }
 
   // Cancel a running/queued job
@@ -977,11 +1088,17 @@
     }
   };
 
-  // Dismiss (remove from view) a completed/failed/cancelled job
-  window.dismissJob = function(jobId) {
-    state.jobs.delete(jobId);
-    renderJobs();
-    updateJobsBadge();
+  // Dismiss (permanently remove) a completed/failed/cancelled/paused job.
+  // We call the server so the dismissal survives a page refresh (github #68).
+  window.dismissJob = async function(jobId) {
+    try {
+      await api('POST', `/jobs/${jobId}/dismiss`);
+      state.jobs.delete(jobId);
+      renderJobs();
+      updateJobsBadge();
+    } catch (e) {
+      showToast(`Failed to dismiss: ${e.message}`, 'error');
+    }
   };
 
   // =========================================

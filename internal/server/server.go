@@ -168,6 +168,7 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/jobs/{id}", s.handleCancelJob)
 	mux.HandleFunc("POST /api/jobs/{id}/pause", s.handlePauseJob)
 	mux.HandleFunc("POST /api/jobs/{id}/resume", s.handleResumeJob)
+	mux.HandleFunc("POST /api/jobs/{id}/dismiss", s.handleDismissJob)
 
 	// Settings
 	mux.HandleFunc("GET /api/settings", s.handleGetSettings)

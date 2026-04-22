@@ -224,6 +224,12 @@ type GGUFInfo struct {
 
 	// Quantizations is the list of available quantizations.
 	Quantizations []GGUFQuantization `json:"quantizations"`
+
+	// MMProjFiles is the list of multimodal projector (vision-encoder) files
+	// that must accompany an LLM quantization download for vision-language
+	// models. Populated when .gguf files whose basename starts with "mmproj"
+	// are present in the repo (e.g. gemma-3, llava, qwen2.5-vl in GGUF form).
+	MMProjFiles []FileInfo `json:"mmproj_files,omitempty"`
 }
 
 // GGUFQuantization represents a single GGUF quantization option.

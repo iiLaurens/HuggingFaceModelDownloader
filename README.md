@@ -97,10 +97,18 @@ bash <(curl -sSL https://g.bodaay.io/hfd) serve
 bash <(curl -sSL https://g.bodaay.io/hfd) serve --auth-user admin --auth-pass secret
 ```
 
-**Like it? Install permanently:**
+**Like it? Install permanently (no sudo):**
 
 ```bash
 bash <(curl -sSL https://g.bodaay.io/hfd) install
+```
+
+By default this installs to `~/.local/bin` (or `~/bin` if that's already on
+your PATH) so no sudo prompt is needed. Pass an explicit path to override:
+
+```bash
+# System-wide install (may prompt for sudo)
+bash <(curl -sSL https://g.bodaay.io/hfd) install /usr/local/bin
 ```
 
 Now use directly:
@@ -202,29 +210,77 @@ hfdownloader download owner/repo -c 16 --max-active 8
 
 ---
 
-## Dual-Layer Storage
+## Storage Modes
 
-We maintain **two views** of your downloads:
+Two modes are fully supported. Pick whichever fits your workflow — neither
+is going away.
+
+### Mode 1 — HuggingFace cache (default, dual-layer)
+
+```bash
+hfdownloader download TheBloke/Mistral-7B-Instruct-v0.2-GGUF
+```
+
+Files go into the standard HuggingFace cache so Python libraries
+(`transformers`, `diffusers`, `huggingface_hub`, llama.cpp's Python
+bindings, …) find them automatically — nothing to configure.
 
 ```
 ~/.cache/huggingface/
-├── hub/                              # Layer 1: HF Cache (Python compatible)
+├── hub/                              # Layer 1: HF cache (Python compatible)
 │   └── models--TheBloke--Mistral.../
-│       └── snapshots/a1b2c3d4.../
-│           └── model.gguf
+│       ├── blobs/                    # real files, content-addressed
+│       ├── snapshots/a1b2c3d4.../
+│       │   └── model.gguf            → symlink to blobs/<sha>
+│       └── refs/main
 │
-└── models/                           # Layer 2: Human-Readable
+└── models/                           # Layer 2: human-readable view
     └── TheBloke/
         └── Mistral-7B-GGUF/
-            ├── model.gguf            → symlink to hub/...
-            └── hfd.yaml              # Download manifest
+            ├── model.gguf            → symlink to hub/.../snapshots/...
+            └── hfd.yaml              # download manifest
 ```
 
-**Layer 1 (hub/)**: Standard HuggingFace cache structure. Python libraries work automatically.
+**Layer 1 (`hub/`)**: Standard HF cache structure. Python tools just work.
+**Layer 2 (`models/`)**: Human-readable paths via symlinks — browse your
+downloads like normal folders.
 
-**Layer 2 (models/)**: Human-readable paths with symlinks. Browse your downloads like normal folders.
+> **Windows**: The friendly view (Layer 2) needs symlinks, which require
+> Administrator or Developer Mode on Windows. Downloads still succeed —
+> files land in Layer 1 — but the readable paths in Layer 2 won't be
+> created. Use Mode 2 below if you want plain files on Windows without
+> elevated privileges.
 
-> **Windows Note**: The friendly view (Layer 2) requires symlinks, which need Administrator privileges or Developer Mode on Windows. Downloads still work — files are stored in the HuggingFace cache (Layer 1) — but the human-readable symlinks won't be created.
+### Mode 2 — Flat files in a directory you choose
+
+If you want **real files** at a path of your choice — no cache, no blob
+hashes, no symlinks — use `--local-dir` (matching
+`huggingface-cli download --local-dir`):
+
+```bash
+hfdownloader download TheBloke/Mistral-7B-Instruct-v0.2-GGUF \
+    --local-dir ./my-model
+```
+
+This is the right mode for:
+
+- Feeding files directly to llama.cpp, ollama, or any tool that expects a
+  plain directory of weights.
+- Windows users who don't want to enable Developer Mode.
+- Sharing a model over NFS, SMB, or a USB drive — hardlinks and symlinks
+  don't travel well; real files do.
+- Air-gapped transfers and manual backups.
+
+The v2.x-compatible spelling `--legacy -o <dir>` produces the **exact same
+result** and is kept permanently for script compatibility:
+
+```bash
+hfdownloader download TheBloke/Mistral-7B-Instruct-v0.2-GGUF \
+    --legacy -o ./my-model
+```
+
+Both spellings are interchangeable; pick whichever reads better in your
+scripts. They are mutually exclusive on a single command line.
 
 ### Manifest Tracking
 
@@ -376,7 +432,13 @@ proxy:
 bash <(curl -sSL https://g.bodaay.io/hfd) install
 ```
 
-That's it. Works on Linux, macOS, and WSL.
+That's it. Works on Linux, macOS, and WSL. Installs to `~/.local/bin` by
+default — no sudo required. Pass an explicit path to install somewhere else:
+
+```bash
+bash <(curl -sSL https://g.bodaay.io/hfd) install /usr/local/bin   # system-wide
+bash <(curl -sSL https://g.bodaay.io/hfd) install ~/bin            # custom
+```
 
 **Or run without installing:**
 
@@ -477,7 +539,8 @@ Full documentation: [docs/CLI.md](docs/CLI.md) • [docs/API.md](docs/API.md) �
 
 | Feature | Description |
 |---------|-------------|
-| **HF Cache Compatibility** | Downloads now use standard HuggingFace cache structure |
+| **HF Cache Compatibility** | Downloads use standard HuggingFace cache structure by default (see [Storage Modes](#storage-modes)) |
+| **`--local-dir` flag** | One-flag opt-in to flat files at a path of your choice — `huggingface-cli`-style |
 | **Dual-Layer Storage** | Python-compatible cache + human-readable symlinks |
 | **Smart Analyzer** | Auto-detect model types, GGUF quality ratings, RAM estimates |
 | **Web UI v3** | Modern interface with real-time WebSocket progress |
@@ -485,13 +548,9 @@ Full documentation: [docs/CLI.md](docs/CLI.md) • [docs/API.md](docs/API.md) �
 | **Full Proxy Support** | HTTP, SOCKS5, authentication, CIDR bypass |
 | **Manifest Tracking** | `hfd.yaml` records what/when/how for every download |
 
-### Upgrading from v2.x
-
-v3.0 uses HF cache by default. For v2.x behavior:
-
-```bash
-hfdownloader download owner/repo --legacy -o ./my-models
-```
+Both storage modes (HF cache and flat-file `--local-dir` / `--legacy -o`)
+are fully supported and permanent — neither is deprecated. See
+[Storage Modes](#storage-modes) for when to pick which.
 
 ---
 

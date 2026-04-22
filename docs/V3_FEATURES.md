@@ -350,16 +350,23 @@ hfdownloader rebuild meta-llama/Llama-2-7b
 
 ### From v2.x to v3.0
 
-1. **Default behavior changed**: v3.0 uses HF cache structure by default
-2. **Legacy mode available**: Use `--legacy` for v2.x flat directory structure
-3. **Output flag deprecated**: `--output` now requires `--legacy`
+1. **Default behavior changed**: v3.0 uses HF cache structure by default.
+2. **Flat-file mode is here to stay**: the v2.x flat directory layout is
+   available under two interchangeable names — the non-legacy `--local-dir`
+   (preferred, matches `huggingface-cli download --local-dir`) and the
+   original `--legacy -o <dir>` form (kept for back-compat).
+3. **`--output` requires `--legacy`**: using `-o <dir>` on its own is an
+   error; pair it with `--legacy`, or use `--local-dir <dir>` instead.
 
 ```bash
-# v2.x behavior (flat structure)
-hfdownloader download meta-llama/Llama-2-7b --legacy -o ./my-models
-
-# v3.0 behavior (HF cache structure)
+# v3.0 default — HF cache structure
 hfdownloader download meta-llama/Llama-2-7b
+
+# Flat files in a directory of your choice (preferred new spelling)
+hfdownloader download meta-llama/Llama-2-7b --local-dir ./my-models
+
+# v2.x-compatible form (still supported, not going away)
+hfdownloader download meta-llama/Llama-2-7b --legacy -o ./my-models
 ```
 
 ### Migration

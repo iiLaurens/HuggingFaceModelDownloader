@@ -66,21 +66,41 @@ type JobFileProgress struct {
 
 // JobManager manages download jobs.
 type JobManager struct {
-	mu         sync.RWMutex
-	jobs       map[string]*Job
-	config     Config
-	listeners  []chan *Job
-	listenerMu sync.RWMutex
-	wsHub      *WSHub
+	mu          sync.RWMutex
+	jobs        map[string]*Job
+	config      Config
+	listeners   []chan *Job
+	listenerMu  sync.RWMutex
+	wsHub       *WSHub
+	wsCoalescer *jobCoalescer
+	// runWG tracks in-flight runJob goroutines so shutdown paths (and
+	// tests) can wait for every download to actually unwind — not just
+	// for Status to flip to Cancelled. Without this a t.TempDir cleanup
+	// can race a still-in-flight mkdir inside the downloader and fail
+	// with "directory not empty".
+	runWG sync.WaitGroup
 }
+
+// wsBroadcastMinGap is the minimum interval between consecutive WebSocket
+// broadcasts for the same job. Progress events arriving inside this window
+// are coalesced — only the latest job state is flushed when the window
+// elapses. Terminal status changes (completed, failed, cancelled, paused)
+// bypass this gate and are sent immediately. See github issue #62.
+const wsBroadcastMinGap = 250 * time.Millisecond
 
 // NewJobManager creates a new job manager.
 func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
-	return &JobManager{
+	m := &JobManager{
 		jobs:   make(map[string]*Job),
 		config: cfg,
 		wsHub:  wsHub,
 	}
+	if wsHub != nil {
+		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
+			wsHub.BroadcastJob(j)
+		})
+	}
+	return m
 }
 
 // generateID creates a short random ID.
@@ -88,6 +108,42 @@ func generateID() string {
 	b := make([]byte, 6)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// cloneJobLocked returns a fully-independent copy of a Job. Must be called
+// while m.mu is held (any lock, read or write) so the fields being copied
+// are stable. The returned *Job can be safely handed to JSON encoders or
+// WebSocket broadcasters without racing against runJob's in-place mutations
+// of the live Job stored in m.jobs. Slice fields are deep-copied so that
+// subsequent mutations of the live job's slices can't leak through a shared
+// backing array.
+func (m *JobManager) cloneJobLocked(j *Job) *Job {
+	if j == nil {
+		return nil
+	}
+	clone := *j
+	clone.cancel = nil
+	if j.Filters != nil {
+		clone.Filters = append([]string(nil), j.Filters...)
+	}
+	if j.Excludes != nil {
+		clone.Excludes = append([]string(nil), j.Excludes...)
+	}
+	if j.Paths != nil {
+		clone.Paths = append([]string(nil), j.Paths...)
+	}
+	if j.Files != nil {
+		clone.Files = append([]JobFileProgress(nil), j.Files...)
+	}
+	if j.StartedAt != nil {
+		t := *j.StartedAt
+		clone.StartedAt = &t
+	}
+	if j.EndedAt != nil {
+		t := *j.EndedAt
+		clone.EndedAt = &t
+	}
+	return &clone
 }
 
 // CreateJob creates a new download job.
@@ -116,8 +172,9 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 			existing.IsDataset == req.Dataset &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			pathsEqual(existing.Paths, req.Paths) {
+			snapshot := m.cloneJobLocked(existing)
 			m.mu.Unlock()
-			return existing, true, nil // Return existing, wasExisting=true
+			return snapshot, true, nil
 		}
 	}
 
@@ -136,12 +193,14 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	}
 
 	m.jobs[job.ID] = job
+	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
 
 	// Start the job
+	m.runWG.Add(1)
 	go m.runJob(job)
 
-	return job, false, nil // New job, wasExisting=false
+	return snapshot, false, nil
 }
 
 // pathsEqual returns true when two Paths slices represent the same set of
@@ -166,22 +225,29 @@ func pathsEqual(a, b []string) bool {
 	return true
 }
 
-// GetJob retrieves a job by ID.
+// GetJob retrieves a snapshot of a job by ID. The returned pointer is a
+// standalone copy; the caller can read its fields without racing against
+// the runJob goroutine that owns the live version in m.jobs.
 func (m *JobManager) GetJob(id string) (*Job, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	job, ok := m.jobs[id]
-	return job, ok
+	if !ok {
+		return nil, false
+	}
+	return m.cloneJobLocked(job), true
 }
 
-// ListJobs returns all jobs.
+// ListJobs returns snapshots of all jobs. Each returned *Job is an
+// independent copy — safe to JSON-encode or hand to the WebSocket hub
+// without holding any lock.
 func (m *JobManager) ListJobs() []*Job {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	jobs := make([]*Job, 0, len(m.jobs))
 	for _, job := range m.jobs {
-		jobs = append(jobs, job)
+		jobs = append(jobs, m.cloneJobLocked(job))
 	}
 	return jobs
 }
@@ -203,47 +269,53 @@ func (m *JobManager) HasActiveJobs() bool {
 // CancelJob cancels a running or queued job.
 func (m *JobManager) CancelJob(id string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	job, ok := m.jobs[id]
 	if !ok {
+		m.mu.Unlock()
 		return false
 	}
 
-	if job.Status == JobStatusQueued || job.Status == JobStatusRunning || job.Status == JobStatusPaused {
-		if job.cancel != nil {
-			job.cancel()
-		}
-		job.Status = JobStatusCancelled
-		now := time.Now()
-		job.EndedAt = &now
-		m.notifyListeners(job)
-		return true
+	if job.Status != JobStatusQueued && job.Status != JobStatusRunning && job.Status != JobStatusPaused {
+		m.mu.Unlock()
+		return false
 	}
 
-	return false
+	if job.cancel != nil {
+		job.cancel()
+	}
+	job.Status = JobStatusCancelled
+	now := time.Now()
+	job.EndedAt = &now
+	snapshot := m.cloneJobLocked(job)
+	m.mu.Unlock()
+
+	m.notifyListeners(snapshot)
+	return true
 }
 
 // PauseJob pauses a running job.
 func (m *JobManager) PauseJob(id string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	job, ok := m.jobs[id]
 	if !ok {
+		m.mu.Unlock()
 		return false
 	}
 
-	if job.Status == JobStatusRunning {
-		if job.cancel != nil {
-			job.cancel()
-		}
-		job.Status = JobStatusPaused
-		m.notifyListeners(job)
-		return true
+	if job.Status != JobStatusRunning {
+		m.mu.Unlock()
+		return false
 	}
 
-	return false
+	if job.cancel != nil {
+		job.cancel()
+	}
+	job.Status = JobStatusPaused
+	snapshot := m.cloneJobLocked(job)
+	m.mu.Unlock()
+
+	m.notifyListeners(snapshot)
+	return true
 }
 
 // ResumeJob resumes a paused job.
@@ -261,16 +333,19 @@ func (m *JobManager) ResumeJob(id string) bool {
 	}
 
 	job.Status = JobStatusQueued
-	// Reset progress - the downloader will re-scan and report all files
-	// Already-downloaded files will be skipped during actual download but reported in plan
+	// Reset progress - the downloader will re-scan and report all files.
+	// Already-downloaded files will be skipped during actual download but
+	// reported in plan.
 	job.Progress = JobProgress{}
 	job.Files = nil
+	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
 
 	// Notify listeners of status change
-	m.notifyListeners(job)
+	m.notifyListeners(snapshot)
 
 	// Restart the job - already downloaded files will be skipped by the downloader
+	m.runWG.Add(1)
 	go m.runJob(job)
 
 	return true
@@ -293,6 +368,67 @@ func (m *JobManager) DeleteJob(id string) bool {
 
 	delete(m.jobs, id)
 	return true
+}
+
+// WaitAll blocks until every in-flight runJob goroutine has returned or
+// until timeout elapses. Returns true if all goroutines exited cleanly,
+// false on timeout. Primarily for tests and graceful shutdown — lets
+// callers observe actual goroutine exit rather than just Status==Cancelled,
+// which is set before the downloader's filesystem operations fully unwind.
+func (m *JobManager) WaitAll(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		m.runWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// DismissJobResult distinguishes the three possible outcomes of a dismiss
+// attempt so the HTTP layer can map them to appropriate status codes.
+type DismissJobResult int
+
+const (
+	// DismissJobOK means the job was in a terminal state and has been removed.
+	DismissJobOK DismissJobResult = iota
+	// DismissJobNotFound means no job with that ID exists.
+	DismissJobNotFound
+	// DismissJobStillActive means the job is queued or running; it must be
+	// cancelled first (or completed) before it can be dismissed.
+	DismissJobStillActive
+)
+
+// DismissJob removes a job from the manager if and only if it is in a
+// terminal state (completed, failed, cancelled, paused). Dismissal is the
+// user's way of hiding a finished job from the UI permanently, and the
+// guarantee that matters for github issue #68 is that the job does not
+// come back on the next page refresh — so the underlying storage drops it.
+// Dismissing a queued or running job is rejected so a stray click can't
+// wipe a live download.
+func (m *JobManager) DismissJob(id string) bool {
+	res, _ := m.DismissJobResult(id)
+	return res == DismissJobOK
+}
+
+// DismissJobResult is the richer variant of DismissJob that returns the
+// reason a dismissal failed, for use by the HTTP handler.
+func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.jobs[id]
+	if !ok {
+		return DismissJobNotFound, nil
+	}
+	if !isTerminalJobStatus(job.Status) {
+		return DismissJobStillActive, job
+	}
+	delete(m.jobs, id)
+	return DismissJobOK, job
 }
 
 // Subscribe adds a listener for job updates.
@@ -318,26 +454,37 @@ func (m *JobManager) Unsubscribe(ch chan *Job) {
 	}
 }
 
-func (m *JobManager) notifyListeners(job *Job) {
-	// Notify channel listeners
+// notifyListeners forwards an already-snapshotted job update to channel
+// listeners and the WebSocket broadcast path. The caller MUST pass in a
+// snapshot (produced by cloneJobLocked while holding m.mu) — this function
+// does not take m.mu itself, so it is safe to call from sites that already
+// hold m.mu.Lock() (like CancelJob / PauseJob with a deferred unlock).
+func (m *JobManager) notifyListeners(snapshot *Job) {
+	// Notify channel listeners (tests and other internal subscribers see
+	// every raw update; only the WebSocket path is throttled).
 	m.listenerMu.RLock()
 	for _, ch := range m.listeners {
 		select {
-		case ch <- job:
+		case ch <- snapshot:
 		default:
 			// Listener is slow, skip
 		}
 	}
 	m.listenerMu.RUnlock()
 
-	// Broadcast to WebSocket clients
-	if m.wsHub != nil {
-		m.wsHub.BroadcastJob(job)
+	// Broadcast to WebSocket clients through the per-job coalescer so the
+	// browser isn't asked to re-render at 5Hz × file-count.
+	if m.wsCoalescer != nil {
+		m.wsCoalescer.schedule(snapshot)
+	} else if m.wsHub != nil {
+		m.wsHub.BroadcastJob(snapshot)
 	}
 }
 
 // runJob executes the download job.
 func (m *JobManager) runJob(job *Job) {
+	defer m.runWG.Done()
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Increment generation and store our generation number
@@ -348,8 +495,9 @@ func (m *JobManager) runJob(job *Job) {
 	job.Status = JobStatusRunning
 	now := time.Now()
 	job.StartedAt = &now
+	startSnap := m.cloneJobLocked(job)
 	m.mu.Unlock()
-	m.notifyListeners(job)
+	m.notifyListeners(startSnap)
 
 	// Create hfdownloader job and settings
 	dlJob := hfdownloader.Job{
@@ -436,8 +584,9 @@ func (m *JobManager) runJob(job *Job) {
 			job.Progress.DownloadedBytes = total
 		}
 
+		progressSnap := m.cloneJobLocked(job)
 		m.mu.Unlock() // Unlock BEFORE notifying to avoid deadlock
-		m.notifyListeners(job)
+		m.notifyListeners(progressSnap)
 	}
 
 	// Run the download
@@ -462,8 +611,9 @@ func (m *JobManager) runJob(job *Job) {
 	} else {
 		job.Status = JobStatusCompleted
 	}
+	endSnap := m.cloneJobLocked(job)
 	m.mu.Unlock()
 
-	m.notifyListeners(job)
+	m.notifyListeners(endSnap)
 }
 

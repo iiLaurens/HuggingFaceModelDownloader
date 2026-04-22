@@ -11,10 +11,6 @@ import (
 
 func TestJobManager_CreateJob(t *testing.T) {
 	testCacheDir := t.TempDir()
-	// Cleanup any created directories before test ends
-	t.Cleanup(func() {
-		os.RemoveAll(testCacheDir)
-	})
 
 	cfg := Config{
 		CacheDir:    testCacheDir,
@@ -25,6 +21,21 @@ func TestJobManager_CreateJob(t *testing.T) {
 	go hub.Run()
 
 	mgr := NewJobManager(cfg, hub)
+
+	// Each CreateJob here spawns a runJob goroutine that tries to download
+	// from a non-existent HF repo. The downloader creates subdirectories
+	// under testCacheDir via EnsureDirs before any HTTP call returns, so
+	// a naive t.TempDir cleanup races those mkdirs and fails with
+	// "directory not empty". Cancel all jobs then block on WaitAll until
+	// every runJob goroutine has actually exited its stack frame — not
+	// just until Status flipped to Cancelled.
+	t.Cleanup(func() {
+		for _, j := range mgr.ListJobs() {
+			mgr.CancelJob(j.ID)
+		}
+		mgr.WaitAll(5 * time.Second)
+		os.RemoveAll(testCacheDir)
+	})
 
 	t.Run("creates model job with HF cache output", func(t *testing.T) {
 		req := DownloadRequest{

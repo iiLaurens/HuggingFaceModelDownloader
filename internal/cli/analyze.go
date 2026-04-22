@@ -294,13 +294,14 @@ func printSelectableItems(info *smartdl.RepoInfo) {
 	}
 
 	categoryTitles := map[string]string{
-		"quantization": "Available Quantizations",
-		"variant":      "Available Variants",
-		"component":    "Available Components",
-		"split":        "Available Splits",
-		"format":       "Weight Formats",
-		"precision":    "Precision Options",
-		"options":      "Available Options",
+		"quantization":   "Available Quantizations",
+		"variant":        "Available Variants",
+		"component":      "Available Components",
+		"split":          "Available Splits",
+		"format":         "Weight Formats",
+		"precision":      "Precision Options",
+		"vision_encoder": "Vision Encoder (mmproj)",
+		"options":        "Available Options",
 	}
 
 	for cat, items := range categories {

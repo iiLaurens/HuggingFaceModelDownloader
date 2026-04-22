@@ -96,7 +96,7 @@ type SuccessResponse struct {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
-		"version": "3.0.3",
+		"version": "3.0.4",
 		"time":    time.Now().UTC().Format(time.RFC3339),
 	})
 }
@@ -334,6 +334,30 @@ func (s *Server) handleResumeJob(w http.ResponseWriter, r *http.Request) {
 		})
 	} else {
 		writeError(w, http.StatusNotFound, "Job not found or not paused", "")
+	}
+}
+
+// handleDismissJob permanently removes a finished job from the list so it
+// doesn't reappear on page refresh (github issue #68 secondary ask). Only
+// jobs in terminal states (completed, failed, cancelled, paused) can be
+// dismissed — active downloads must be cancelled first.
+func (s *Server) handleDismissJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "Missing job ID", "")
+		return
+	}
+
+	switch res, _ := s.jobs.DismissJobResult(id); res {
+	case DismissJobOK:
+		writeJSON(w, http.StatusOK, SuccessResponse{
+			Success: true,
+			Message: "Job dismissed",
+		})
+	case DismissJobStillActive:
+		writeError(w, http.StatusConflict, "Cannot dismiss an active job; cancel it first", "")
+	default:
+		writeError(w, http.StatusNotFound, "Job not found", "")
 	}
 }
 
@@ -983,64 +1007,6 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// PruneResponse represents the result of a cache prune operation.
-type PruneResponse struct {
-	Success           bool     `json:"success"`
-	ReposScanned      int      `json:"reposScanned"`
-	IncompleteRemoved int      `json:"incompleteRemoved"`
-	TempRemoved       int      `json:"tempRemoved"`
-	OrphanedRemoved   int      `json:"orphanedRemoved"`
-	SpaceFreed        int64    `json:"spaceFreed"`
-	SpaceFreedHuman   string   `json:"spaceFreedHuman"`
-	Errors            []string `json:"errors,omitempty"`
-	Message           string   `json:"message"`
-}
-
-// handleCachePrune removes stale incomplete downloads, leftover tmp-* files,
-// and orphaned blobs from the cache.  It refuses to run while any download
-// jobs are active to prevent data corruption.
-func (s *Server) handleCachePrune(w http.ResponseWriter, r *http.Request) {
-	if s.jobs.HasActiveJobs() {
-		writeError(w, http.StatusConflict, "Downloads are active",
-			"Please wait for all downloads to finish or cancel them before pruning.")
-		return
-	}
-
-	cacheDir := s.config.CacheDir
-	if cacheDir == "" {
-		cacheDir = hfdownloader.DefaultCacheDir()
-	}
-
-	cache := hfdownloader.NewHFCache(cacheDir, hfdownloader.DefaultStaleTimeout)
-	result, err := cache.Prune()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Prune failed", err.Error())
-		return
-	}
-
-	resp := PruneResponse{
-		Success:           true,
-		ReposScanned:      result.ReposScanned,
-		IncompleteRemoved: result.IncompleteRemoved,
-		TempRemoved:       result.TempRemoved,
-		OrphanedRemoved:   result.OrphanedRemoved,
-		SpaceFreed:        result.SpaceFreed,
-		SpaceFreedHuman:   humanSizeBytes(result.SpaceFreed),
-	}
-	for _, e := range result.Errors {
-		resp.Errors = append(resp.Errors, e.Error())
-	}
-
-	total := result.IncompleteRemoved + result.TempRemoved + result.OrphanedRemoved
-	if total == 0 {
-		resp.Message = "Cache is already clean, nothing to prune"
-	} else {
-		resp.Message = fmt.Sprintf("Removed %d item(s), freed %s", total, resp.SpaceFreedHuman)
-	}
-
-	writeJSON(w, http.StatusOK, resp)
-}
-
 // handleCacheDelete deletes a repository from the cache.
 // SECURITY: This endpoint requires extensive validation to prevent:
 // - Path traversal attacks (../, encoded variants)
@@ -1313,6 +1279,78 @@ func splitCommand(command string) []string {
 	return parts
 }
 
+// humanSizeBytes converts bytes to human-readable format.
+func humanSizeBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// PruneResponse represents the result of a cache prune operation.
+type PruneResponse struct {
+	Success           bool     `json:"success"`
+	ReposScanned      int      `json:"reposScanned"`
+	IncompleteRemoved int      `json:"incompleteRemoved"`
+	TempRemoved       int      `json:"tempRemoved"`
+	OrphanedRemoved   int      `json:"orphanedRemoved"`
+	SpaceFreed        int64    `json:"spaceFreed"`
+	SpaceFreedHuman   string   `json:"spaceFreedHuman"`
+	Errors            []string `json:"errors,omitempty"`
+	Message           string   `json:"message"`
+}
+
+// handleCachePrune removes stale incomplete downloads, leftover tmp-* files,
+// and orphaned blobs from the cache.  It refuses to run while any download
+// jobs are active to prevent data corruption.
+func (s *Server) handleCachePrune(w http.ResponseWriter, r *http.Request) {
+	if s.jobs.HasActiveJobs() {
+		writeError(w, http.StatusConflict, "Downloads are active",
+			"Please wait for all downloads to finish or cancel them before pruning.")
+		return
+	}
+
+	cacheDir := s.config.CacheDir
+	if cacheDir == "" {
+		cacheDir = hfdownloader.DefaultCacheDir()
+	}
+
+	cache := hfdownloader.NewHFCache(cacheDir, hfdownloader.DefaultStaleTimeout)
+	result, err := cache.Prune()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Prune failed", err.Error())
+		return
+	}
+
+	resp := PruneResponse{
+		Success:           true,
+		ReposScanned:      result.ReposScanned,
+		IncompleteRemoved: result.IncompleteRemoved,
+		TempRemoved:       result.TempRemoved,
+		OrphanedRemoved:   result.OrphanedRemoved,
+		SpaceFreed:        result.SpaceFreed,
+		SpaceFreedHuman:   humanSizeBytes(result.SpaceFreed),
+	}
+	for _, e := range result.Errors {
+		resp.Errors = append(resp.Errors, e.Error())
+	}
+
+	total := result.IncompleteRemoved + result.TempRemoved + result.OrphanedRemoved
+	if total == 0 {
+		resp.Message = "Cache is already clean, nothing to prune"
+	} else {
+		resp.Message = fmt.Sprintf("Removed %d item(s), freed %s", total, resp.SpaceFreedHuman)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // handleCacheDeleteFiles deletes individual files from a cached repository.
 // It removes snapshot symlinks, friendly-view symlinks, and blobs with no remaining references.
 // SECURITY: applies the same validation as handleCacheDelete.
@@ -1508,20 +1546,6 @@ func isReferenced(blobPath, repoPath string) bool {
 		return nil
 	})
 	return found
-}
-
-// humanSizeBytes converts bytes to human-readable format.
-func humanSizeBytes(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // --- Update Check ---
