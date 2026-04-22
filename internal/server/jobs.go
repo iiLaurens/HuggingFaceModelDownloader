@@ -33,6 +33,7 @@ type Job struct {
 	IsDataset bool              `json:"isDataset,omitempty"`
 	Filters   []string          `json:"filters,omitempty"`
 	Excludes  []string          `json:"excludes,omitempty"`
+	Paths     []string          `json:"paths,omitempty"`
 	OutputDir string            `json:"outputDir"`
 	Status    JobStatus         `json:"status"`
 	Progress  JobProgress       `json:"progress"`
@@ -128,6 +129,9 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	if j.Excludes != nil {
 		clone.Excludes = append([]string(nil), j.Excludes...)
 	}
+	if j.Paths != nil {
+		clone.Paths = append([]string(nil), j.Paths...)
+	}
 	if j.Files != nil {
 		clone.Files = append([]JobFileProgress(nil), j.Files...)
 	}
@@ -143,7 +147,9 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 }
 
 // CreateJob creates a new download job.
-// Returns existing job if same repo+revision+dataset is already in progress.
+// Returns existing job if same repo+revision+dataset+paths is already in progress.
+// Jobs that specify explicit Paths are never de-duplicated against full-repo jobs
+// (and vice versa), so that a targeted update always gets its own job entry.
 func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	revision := req.Revision
 	if revision == "" {
@@ -156,15 +162,16 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		cacheDir = hfdownloader.DefaultCacheDir()
 	}
 
-	// Check for existing active job with same repo+revision+type.
-	// Returning a clone prevents the caller's JSON encoder from racing
-	// against runJob's in-place mutations of the live job.
+	// De-duplicate: only match when both jobs are full-repo downloads (no Paths)
+	// OR when both have identical Paths slices.  A paths-based update is always
+	// treated as distinct from a full-repo job so it gets its own visible entry.
 	m.mu.Lock()
 	for _, existing := range m.jobs {
 		if existing.Repo == req.Repo &&
 			existing.Revision == revision &&
 			existing.IsDataset == req.Dataset &&
-			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) {
+			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
+			pathsEqual(existing.Paths, req.Paths) {
 			snapshot := m.cloneJobLocked(existing)
 			m.mu.Unlock()
 			return snapshot, true, nil
@@ -178,6 +185,7 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 		IsDataset: req.Dataset,
 		Filters:   req.Filters,
 		Excludes:  req.Excludes,
+		Paths:     req.Paths,
 		OutputDir: cacheDir, // HuggingFace cache directory
 		Status:    JobStatusQueued,
 		CreatedAt: time.Now(),
@@ -193,6 +201,28 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	go m.runJob(job)
 
 	return snapshot, false, nil
+}
+
+// pathsEqual returns true when two Paths slices represent the same set of
+// files.  Two nil/empty slices are considered equal (both mean "full repo").
+func pathsEqual(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, p := range a {
+		seen[p]++
+	}
+	for _, p := range b {
+		seen[p]--
+		if seen[p] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // GetJob retrieves a snapshot of a job by ID. The returned pointer is a
@@ -220,6 +250,20 @@ func (m *JobManager) ListJobs() []*Job {
 		jobs = append(jobs, m.cloneJobLocked(job))
 	}
 	return jobs
+}
+
+// HasActiveJobs returns true if any jobs are currently running, queued, or paused.
+func (m *JobManager) HasActiveJobs() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, job := range m.jobs {
+		switch job.Status {
+		case JobStatusRunning, JobStatusQueued, JobStatusPaused:
+			return true
+		}
+	}
+	return false
 }
 
 // CancelJob cancels a running or queued job.
@@ -462,6 +506,7 @@ func (m *JobManager) runJob(job *Job) {
 		IsDataset:          job.IsDataset,
 		Filters:            job.Filters,
 		Excludes:           job.Excludes,
+		Paths:              job.Paths,
 		AppendFilterSubdir: false,
 	}
 
@@ -477,6 +522,7 @@ func (m *JobManager) runJob(job *Job) {
 		MaxActiveDownloads: m.config.MaxActive,
 		Token:              m.config.Token,
 		MultipartThreshold: m.config.MultipartThreshold,
+		PartSize:           m.config.PartSize,
 		Verify:             m.config.Verify,
 		Retries:            m.config.Retries,
 		BackoffInitial:     "400ms",

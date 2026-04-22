@@ -68,7 +68,7 @@ func TestDownloadSingle_ResumesFromExistingPartial(t *testing.T) {
 	}
 	cfg := Settings{Retries: 0}
 
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestDownloadSingle_CompletePartialIsFinalized(t *testing.T) {
 		URL:          srv.URL + "/test.bin",
 		Size:         int64(len(full)),
 	}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 		URL:          srv.URL + "/test.bin",
 		Size:         int64(len(full)),
 	}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 0}, it, dst, func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	}
 	cfg := Settings{Concurrency: nParts, Retries: 0}
 
-	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}, partSize)
 	if err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}

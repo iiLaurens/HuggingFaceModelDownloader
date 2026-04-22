@@ -107,7 +107,7 @@ func TestDownloadMultipart_ResumesAfterFlakyConnection(t *testing.T) {
 	}
 	cfg := Settings{Concurrency: nParts, Retries: 5}
 
-	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}, partSize)
 	if err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 		BackoffMax:     "100ms",
 	}
 
-	err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, emit)
+	_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, emit, 32<<20)
 	if err == nil {
 		t.Fatal("downloadMultipart succeeded despite cancellation — expected a context error")
 	}
@@ -400,7 +400,7 @@ func TestDownloadMultipart_ProgressMonotonic(t *testing.T) {
 	}
 	cfg := Settings{Concurrency: nParts, Retries: 5}
 
-	err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, emit)
+	_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, emit, 32<<20)
 	if err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}

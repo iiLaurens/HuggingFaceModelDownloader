@@ -5,6 +5,8 @@ package hfdownloader
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -55,6 +57,22 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 		}
 	}
 	return n, err
+}
+
+// countingReader wraps an io.Reader and atomically increments a counter by
+// the number of bytes read. Used to track in-flight download bytes across
+// multiple concurrent workers without holding any locks.
+type countingReader struct {
+	r       io.Reader
+	counter *int64
+}
+
+func (cr *countingReader) Read(p []byte) (n int, err error) {
+	n, err = cr.r.Read(p)
+	if n > 0 {
+		atomic.AddInt64(cr.counter, int64(n))
+	}
+	return
 }
 
 // Download scans and downloads files from a HuggingFace repo.
@@ -121,6 +139,14 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	thresholdBytes, err := parseSizeString(cfg.MultipartThreshold, 256<<20)
 	if err != nil {
 		return fmt.Errorf("invalid multipart-threshold: %w", err)
+	}
+
+	partSize, err := parseSizeString(cfg.PartSize, 32<<20)
+	if err != nil {
+		return fmt.Errorf("invalid part-size: %w", err)
+	}
+	if partSize < 1<<20 {
+		partSize = 1 << 20 // floor at 1 MiB to avoid degenerate behaviour
 	}
 
 	httpc := buildHTTPClientWithProxy(cfg.Proxy)
@@ -301,11 +327,12 @@ LOOP:
 			itForIO.RelativePath = finalRel
 
 			// Choose single/multipart path
+			var computedSHA string
 			var dlErr error
 			if it.Size >= thresholdBytes && it.AcceptRanges {
-				dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+				computedSHA, dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit, partSize)
 			} else {
-				dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+				computedSHA, dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
 			}
 			if dlErr != nil {
 				select {
@@ -315,11 +342,12 @@ LOOP:
 				return
 			}
 
-			// Verify after download
+			// Verify after download — use the hash computed during streaming to
+			// avoid a full second read of the file.
 			if it.LFS && it.SHA256 != "" {
-				if err := verifySHA256(dst, it.SHA256); err != nil {
+				if !strings.EqualFold(computedSHA, it.SHA256) {
 					select {
-					case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
+					case errCh <- fmt.Errorf("sha256 verify failed: %s: expected %s got %s", finalRel, it.SHA256, computedSHA):
 					default:
 					}
 					return
@@ -335,22 +363,20 @@ LOOP:
 				}
 			} else if cfg.Verify == "sha256" {
 				_, remoteSha, _ := headForETag(fileCtx, httpc, cfg.Token, itForIO)
-				if remoteSha != "" {
-					if err := verifySHA256(dst, remoteSha); err != nil {
-						select {
-						case errCh <- fmt.Errorf("sha256 verify failed: %s: %w", finalRel, err):
-						default:
-						}
-						return
+				if remoteSha != "" && !strings.EqualFold(computedSHA, remoteSha) {
+					select {
+					case errCh <- fmt.Errorf("sha256 verify failed: %s: expected %s got %s", finalRel, remoteSha, computedSHA):
+					default:
 					}
+					return
 				}
 			}
 
-			// For HF Cache mode: move to blob and create symlinks
+			// For HF Cache mode: move to blob and create symlinks.
+			// Pass computedSHA so StoreDownloadedFile skips its own re-read.
 			var finalSHA256 string
 			if useHFCache {
-				sha := it.SHA256
-				result, err := repoDir.StoreDownloadedFile(dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView)
+				result, err := repoDir.StoreDownloadedFile(dst, it.RelativePath, plan.Commit, computedSHA, filterSubdir, cfg.NoFriendlyView)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -435,41 +461,52 @@ LOOP:
 	return nil
 }
 
-// downloadSingle downloads a file in a single request.
+// downloadSingle downloads a file in a single request and returns the
+// SHA-256 hash computed incrementally during the download.
 //
 // Resume behavior: if a .part file already exists from a previous interrupted
 // run, its bytes are preserved and the HTTP request uses a Range header to
 // fetch only the remaining bytes. If the server ignores the Range header and
 // responds with 200 (full body), the .part file is truncated and the download
 // restarts from zero.
-func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
+func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) (string, error) {
 	tmp := dst + ".part"
 	out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer out.Close()
 
 	fi, err := out.Stat()
 	if err != nil {
-		return err
+		return "", err
 	}
 	pos := fi.Size()
 
-	// If the partial is already exactly the right size, finalize without network.
+	// If the partial is already exactly the right size, compute SHA and finalize.
 	if it.Size > 0 && pos == it.Size {
+		h := sha256.New()
+		if _, err := out.Seek(0, io.SeekStart); err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(h, out); err != nil {
+			return "", err
+		}
 		out.Close()
-		return os.Rename(tmp, dst)
+		if err := os.Rename(tmp, dst); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
 	}
 	// If the partial is larger than expected (stale/corrupt), start over.
 	if it.Size > 0 && pos > it.Size {
 		if err := out.Truncate(0); err != nil {
-			return err
+			return "", err
 		}
 		pos = 0
 	}
 	if _, err := out.Seek(pos, io.SeekStart); err != nil {
-		return err
+		return "", err
 	}
 	if pos > 0 {
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size})
@@ -481,7 +518,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	for attempt := 0; attempt <= cfg.Retries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		default:
 		}
 
@@ -504,11 +541,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			if pos > 0 && resp.StatusCode == http.StatusOK {
 				if err := out.Truncate(0); err != nil {
 					resp.Body.Close()
-					return err
+					return "", err
 				}
 				if _, err := out.Seek(0, io.SeekStart); err != nil {
 					resp.Body.Close()
-					return err
+					return "", err
 				}
 				pos = 0
 			}
@@ -516,13 +553,32 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				lastErr = fmt.Errorf("bad status: %s", resp.Status)
 				resp.Body.Close()
 			} else {
+				// Seed the hasher with bytes already on disk (resume case).
+				h := sha256.New()
+				if pos > 0 {
+					if _, err := out.Seek(0, io.SeekStart); err != nil {
+						resp.Body.Close()
+						return "", err
+					}
+					if _, err := io.CopyN(h, out, pos); err != nil {
+						resp.Body.Close()
+						return "", err
+					}
+					if _, err := out.Seek(pos, io.SeekStart); err != nil {
+						resp.Body.Close()
+						return "", err
+					}
+				}
 				pr := newProgressReader(resp.Body, it.Size, it.RelativePath, emit)
 				pr.downloaded = pos // emitted progress reflects cumulative bytes
-				_, cerr := io.Copy(out, pr)
+				_, cerr := io.Copy(io.MultiWriter(out, h), pr)
 				resp.Body.Close()
 				if cerr == nil {
 					out.Close()
-					return os.Rename(tmp, dst)
+					if err := os.Rename(tmp, dst); err != nil {
+						return "", err
+					}
+					return hex.EncodeToString(h.Sum(nil)), nil
 				}
 				lastErr = cerr
 				// Update pos to current file position so the next retry issues
@@ -536,21 +592,22 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		if attempt < cfg.Retries {
 			emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
 			if d := retry.Next(); !sleepCtx(ctx, d) {
-				return ctx.Err()
+				return "", ctx.Err()
 			}
 		}
 	}
-	return lastErr
+	return "", lastErr
 }
 
-// downloadMultipart downloads a file using multiple parallel range requests.
-func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent)) error {
+// downloadMultipart downloads a file using multiple parallel range requests and
+// returns the SHA-256 hash computed during assembly.
+func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent), partSize int64) (string, error) {
 	// HEAD to resolve size
 	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
 	addAuth(req, token)
 	resp, err := httpc.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	resp.Body.Close()
 
@@ -565,28 +622,26 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
 	}
 
-	// Plan parts
-	n := cfg.Concurrency
-	chunk := it.Size / int64(n)
-	if chunk <= 0 {
-		chunk = it.Size
-		n = 1
+	// Plan parts using configurable partSize
+	numParts := int((it.Size + partSize - 1) / partSize)
+	if numParts < 1 {
+		numParts = 1
 	}
 
-	tmpParts := make([]string, n)
-	for i := 0; i < n; i++ {
+	tmpParts := make([]string, numParts)
+	for i := 0; i < numParts; i++ {
 		tmpParts[i] = fmt.Sprintf("%s.part-%02d", dst, i)
 	}
 
 	// Download parts in parallel
 	var wg sync.WaitGroup
-	errCh := make(chan error, n)
+	errCh := make(chan error, numParts)
 
-	for i := 0; i < n; i++ {
+	for i := 0; i < numParts; i++ {
 		i := i
-		start := int64(i) * chunk
-		end := start + chunk - 1
-		if i == n-1 {
+		start := int64(i) * partSize
+		end := start + partSize - 1
+		if end >= it.Size {
 			end = it.Size - 1
 		}
 
@@ -689,16 +744,13 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		}()
 	}
 
-	// Emit periodic progress while parts download. The ticker is stopped
-	// cleanly after wg.Wait() so it cannot observe mid-assembly state (parts
-	// being deleted) and emit a bogus 0-byte progress event — the bug behind
-	// the "progress jumps 2.4% ↔ 2.5% for hours" symptom in github #75.
+	// Emit periodic progress while parts download.
 	tickerDone := make(chan struct{})
 	var tickerWG sync.WaitGroup
 	tickerWG.Add(1)
 	go func() {
 		defer tickerWG.Done()
-		t := time.NewTicker(200 * time.Millisecond) // More frequent updates for responsive UI
+		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
 		for {
 			select {
@@ -720,64 +772,57 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 	wg.Wait()
 
-	// Stop the progress ticker and wait for it to exit before touching the
-	// part files. Any in-flight tick will finish and emit one final event
-	// while parts are still on disk at their real sizes.
+	// Stop the progress ticker before touching part files.
 	close(tickerDone)
 	tickerWG.Wait()
 
-	// If the context was cancelled while parts were running (pause / abort /
-	// timeout), return the cancellation error immediately. Part goroutines
-	// that exit via their ctx-aware retry/sleep path do NOT push to errCh,
-	// so we cannot rely on the errCh drain to catch this — we must check
-	// ctx.Err() explicitly. Returning here is critical: it prevents the
-	// bogus "downloaded == total" progress emit below AND stops the
-	// assembly loop from stitching an incomplete part set into a corrupt
-	// final file and deleting the partial bytes the next resume needs.
+	// If the context was cancelled, return the cancellation error immediately.
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return "", ctx.Err()
 	}
 
 	select {
 	case e := <-errCh:
-		return e
+		return "", e
 	default:
 	}
 
 	// Emit one explicit full-progress reading so the caller's last observed
-	// file_progress value is the full byte count, regardless of when the
-	// ticker happened to last fire.
+	// file_progress value is the full byte count.
 	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
 
-	// Assemble parts
+	// Assemble parts, computing SHA-256 during assembly to avoid a second read.
 	out, err := os.Create(dst + ".part")
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	for i := 0; i < n; i++ {
+	h := sha256.New()
+	mw := io.MultiWriter(out, h)
+
+	for i := 0; i < numParts; i++ {
 		p := tmpParts[i]
 		in, err := os.Open(p)
 		if err != nil {
 			out.Close()
-			return err
+			return "", err
 		}
-		if _, err := io.Copy(out, in); err != nil {
+		if _, err := io.Copy(mw, in); err != nil {
 			in.Close()
 			out.Close()
-			return err
+			return "", err
 		}
 		in.Close()
 	}
 	out.Close()
 
 	if err := os.Rename(dst+".part", dst); err != nil {
-		return err
+		return "", err
 	}
 
 	for _, p := range tmpParts {
 		_ = os.Remove(p)
 	}
 
-	return nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

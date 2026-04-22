@@ -76,6 +76,14 @@ type Job struct {
 	// Instead of:
 	//   <output>/<repo>/<filename>
 	AppendFilterSubdir bool
+
+	// Paths is an optional list of exact relative file paths to download.
+	// When non-empty, only files whose relative path exactly matches one of
+	// the entries are included; the Filters and Excludes fields are ignored.
+	//
+	// Example:
+	//   Paths: []string{"config.json", "model.Q4_K_M.gguf"}
+	Paths []string
 }
 
 // Settings configures download behavior.
@@ -138,6 +146,14 @@ type Settings struct {
 	// Accepts human-readable sizes: "32MiB", "256MB", "1GiB", etc.
 	// If empty, defaults to "256MiB".
 	MultipartThreshold string
+
+	// PartSize is the size of each part (chunk) used in multipart downloads.
+	// Larger parts reduce the number of HTTP requests and improve throughput
+	// on fast connections (e.g. 500 Mbps+), at the cost of higher memory use.
+	// Accepts human-readable sizes: "8MiB", "32MiB", "128MiB", etc.
+	// Peak memory per file is bounded to ~512 MiB regardless of this value.
+	// If empty, defaults to "32MiB".
+	PartSize string
 
 	// Verify specifies how to verify non-LFS files after download.
 	// LFS files are always verified by SHA-256 when the hash is available.
@@ -296,6 +312,7 @@ func DefaultSettings() Settings {
 		Concurrency:        8,
 		MaxActiveDownloads: 4,
 		MultipartThreshold: "256MiB",
+		PartSize:           "32MiB",
 		Verify:             "size",
 		Retries:            4,
 		BackoffInitial:     "400ms",

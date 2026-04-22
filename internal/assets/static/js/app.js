@@ -165,7 +165,9 @@
     const data = await res.json();
 
     if (!res.ok) {
-      throw new Error(data.error || 'API error');
+      const err = new Error(data.error || 'API error');
+      err.status = res.status;
+      throw err;
     }
     return data;
   }
@@ -374,19 +376,6 @@
     const resultDiv = $('#analyzeResult');
     if (!resultDiv) return;
 
-    const filesHtml = data.files?.slice(0, 20).map(f => `
-      <div class="analysis-file">
-        <span class="analysis-file-name">${escapeHtml(f.path || f.name)}</span>
-        <span class="analysis-file-size">${f.size_human || formatBytes(f.size)}</span>
-      </div>
-    `).join('') || '';
-
-    const moreFiles = (data.files?.length || 0) > 20
-      ? `<div class="analysis-file" style="justify-content: center; color: var(--color-text-muted);">
-           ... and ${data.files.length - 20} more files
-         </div>`
-      : '';
-
     // Build type-specific info
     let typeInfoHtml = '';
 
@@ -477,20 +466,6 @@
       `;
     }
 
-    // Build unified selectable items section (works for all types)
-    let selectableItemsHtml = '';
-    const hasSelectableItems = data.selectable_items && data.selectable_items.length > 0;
-
-    if (hasSelectableItems) {
-      selectableItemsHtml = `
-        <div class="analysis-section">
-          <h4>Select Files to Download</h4>
-          <p style="font-size: 13px; color: var(--color-text-muted); margin-bottom: 12px;">Choose which files you want to download:</p>
-          ${renderSelectableItems(data.selectable_items, 'selectableItems')}
-        </div>
-      `;
-    }
-
     // Build related downloads section (for LoRA base models, etc.)
     const relatedDownloadsHtml = renderRelatedDownloads(data.related_downloads);
 
@@ -532,13 +507,11 @@
         </div>
         <div class="analysis-body">
           ${typeInfoHtml}
-          ${selectableItemsHtml}
           ${relatedDownloadsHtml}
           <div class="analysis-section">
-            <h4>Files <span id="selectedFilesCount" style="font-weight: normal; color: var(--color-text-muted);"></span></h4>
+            <h4>Files</h4>
             <div class="analysis-files" id="analysisFilesList">
-              ${filesHtml}
-              ${moreFiles}
+              ${renderFileBrowser(data.files)}
             </div>
           </div>
         </div>
@@ -559,11 +532,7 @@
       </div>
     `;
 
-    // Initialize selectable items event handlers
-    if (hasSelectableItems) {
-      initSelectableItems();
-      updateCLICommandFromSelections();
-    }
+    updateCLICommand();
   }
 
   // Clear analysis and reset to initial state
@@ -697,34 +666,37 @@
     advancedOptions.exclude = $('#advExclude')?.value || '';
 
     hideModal();
-    updateDownloadCommand();
+    updateCLICommand();
     showToast('Options applied', 'success');
   };
 
   // Start download from wizard with selected options
   window.startWizardDownload = async function(repo, isDataset) {
-    // Get selected items from unified selector (new) or legacy quantOptions
-    let selectedItems = Array.from(document.querySelectorAll('.selectable-items input[type="checkbox"]:checked'))
-      .map(cb => cb.value);
-
-    // Fallback to legacy GGUF selector if no new selectable items
-    if (selectedItems.length === 0) {
-      selectedItems = Array.from(document.querySelectorAll('#quantOptions input[type="checkbox"]:checked'))
-        .map(cb => cb.dataset.filter);
-    }
-
-    // Build filters - prefer selections, fallback to advanced options
+    // Prefer file-browser checkbox selections; fall back to advanced options filter text
+    const selectedItems = getFileBrowserFilters();
     let filters = [];
-    const totalItems = document.querySelectorAll('.selectable-items input[type="checkbox"], #quantOptions input[type="checkbox"]').length;
+    let paths = [];
 
-    // Only add filter if user selected a subset (not all)
-    if (selectedItems.length > 0 && selectedItems.length < totalItems) {
-      filters = selectedItems;
+    if (selectedItems.length > 0) {
+      // Determine whether every selected item is an individual file (exact relative path)
+      // versus a directory name (collapsed folder checkbox).
+      // Directory names match keys of _fileBrowserTree.dirs; file paths do not.
+      const knownDirs = _fileBrowserTree ? new Set(Object.keys(_fileBrowserTree.dirs)) : new Set();
+      const allExactFiles = selectedItems.every(item => !knownDirs.has(item));
+
+      if (allExactFiles) {
+        // All selections are individual files → use exact-path matching.
+        // This is more precise than substring filters: no accidental partial matches.
+        paths = selectedItems;
+      } else {
+        // Mix of files and directories → fall back to substring filter matching,
+        // which already handles directory-level filtering correctly.
+        filters = selectedItems;
+      }
     } else if (advancedOptions.filter) {
       filters = advancedOptions.filter.split(',').map(s => s.trim()).filter(Boolean);
     }
 
-    // Build excludes from advanced options
     const excludes = advancedOptions.exclude
       ? advancedOptions.exclude.split(',').map(s => s.trim()).filter(Boolean)
       : [];
@@ -734,8 +706,8 @@
         repo,
         revision: currentAnalysis?.branch || 'main',
         dataset: isDataset,
-        filters,
-        excludes
+        excludes,
+        ...(paths.length > 0 ? { paths } : { filters }),
       };
 
       await api('POST', '/download', body);
@@ -1136,8 +1108,15 @@
   let cacheData = { repos: [], stats: {}, cacheDir: '' };
   let cacheFilter = 'all';
   let cacheSort = 'name';
-  let cacheView = 'grid';
+  let cacheView = 'list';
   let cacheSearch = '';
+  // Update-check results keyed by "repo:type" (e.g. "TheBloke/Mistral:model")
+  let cacheUpdateResults = {};
+  // State for the currently-open detail modal
+  let currentModalRepo = null;
+  let currentModalType = null;
+  let currentModalData = null;
+  let currentUpdateCheck = null;
 
   async function loadCache() {
     const container = $('#cacheList');
@@ -1268,6 +1247,25 @@
       statusBadge = '<span class="cache-badge cache-badge-manifest" title="Has manifest file">Tracked</span>';
     }
 
+    // Build update badge from cached check result
+    const updateKey = `${repo.repo}:${repo.type}`;
+    const upd = cacheUpdateResults[updateKey];
+    let updateBadge = '';
+    if (upd) {
+      if (upd.updatedFiles > 0) {
+        updateBadge = `<span class="cache-badge cache-badge-update" title="${upd.updatedFiles} file(s) have upstream updates">${upd.updatedFiles} update${upd.updatedFiles !== 1 ? 's' : ''}</span>`;
+      } else if (upd.commitChanged) {
+        updateBadge = `<span class="cache-badge cache-badge-update" title="New upstream commit (${escapeHtml(upd.remoteCommit.slice(0,7))}) — no locally-cached files changed">New version</span>`;
+      } else {
+        updateBadge = `<span class="cache-badge cache-badge-current" title="All cached files match upstream">Up to date</span>`;
+      }
+    }
+
+    const checkUpdatesIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
+      <path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
+      <path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
+    </svg>`;
+
     return `
       <div class="cache-card" onclick="showCacheDetails('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')">
         <div class="cache-card-header">
@@ -1300,7 +1298,14 @@
         </div>
         <div class="cache-card-footer">
           ${repo.commit ? `<code class="cache-commit" title="Commit: ${escapeHtml(repo.commit)}">${escapeHtml(repo.commit)}</code>` : ''}
-          ${repo.downloaded ? `<span class="cache-date">${escapeHtml(repo.downloaded)}</span>` : ''}
+          <span style="flex:1"></span>
+          ${updateBadge}
+          <button class="btn btn-ghost btn-sm cache-check-update-btn"
+            onclick="event.stopPropagation(); checkRepoUpdates('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')"
+            id="updBtn-${escapeHtml(updateKey.replace(/[^a-z0-9]/gi,'_'))}"
+            title="Check for upstream updates">
+            ${checkUpdatesIcon}
+          </button>
         </div>
       </div>
     `;
@@ -1326,6 +1331,20 @@
       statusBadge = '<span class="cache-badge cache-badge-manifest">Tracked</span>';
     }
 
+    // Build update badge from cached check result
+    const updateKey = `${repo.repo}:${repo.type}`;
+    const upd = cacheUpdateResults[updateKey];
+    let updateBadge = '';
+    if (upd) {
+      if (upd.updatedFiles > 0) {
+        updateBadge = `<span class="cache-badge cache-badge-update" title="${upd.updatedFiles} file(s) have upstream updates">${upd.updatedFiles} update${upd.updatedFiles !== 1 ? 's' : ''}</span>`;
+      } else if (upd.commitChanged) {
+        updateBadge = `<span class="cache-badge cache-badge-update" title="New upstream commit available">New version</span>`;
+      } else {
+        updateBadge = `<span class="cache-badge cache-badge-current" title="All cached files match upstream">Up to date</span>`;
+      }
+    }
+
     return `
       <div class="cache-table-row" onclick="showCacheDetails('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')">
         <div class="cache-col-type">
@@ -1337,11 +1356,20 @@
         <div class="cache-col-repo">
           <span class="cache-repo-name">${escapeHtml(repo.repo)}</span>
           ${statusBadge}
+          ${updateBadge}
         </div>
         <div class="cache-col-size">${escapeHtml(repo.sizeHuman)}</div>
         <div class="cache-col-files">${repo.fileCount}</div>
         <div class="cache-col-date">${escapeHtml(repo.downloaded || '-')}</div>
         <div class="cache-col-actions">
+          <button class="btn btn-ghost btn-sm"
+            onclick="event.stopPropagation(); checkRepoUpdates('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')"
+            title="Check for upstream updates">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
+              <path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
+            </svg>
+          </button>
           <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); showCacheDetails('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')" title="View details">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
               <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
@@ -1352,10 +1380,72 @@
     `;
   }
 
+  // Renders the file list section inside the detail modal.
+  // When updateCheck is provided, per-file update icons are shown.
+  function renderModalFiles(data, updateCheck) {
+    if (!data.files?.length) return '';
+
+    // Build a map of filename → update info for O(1) lookup
+    const updateMap = {};
+    if (updateCheck?.files) {
+      for (const f of updateCheck.files) {
+        updateMap[f.name] = f;
+      }
+    }
+
+    const updateIcon = `<span class="cache-file-update-icon" title="Update available upstream">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
+        <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+        <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+      </svg>
+      update
+    </span>`;
+
+    return `<div class="cache-detail-files">
+      <div class="cache-files-select-bar">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="cacheFileSelectAll" onchange="toggleAllCacheFiles(this)">
+          <span>Select all</span>
+        </label>
+        <span id="cacheFileSelectedCount" style="color:var(--color-text-muted);font-size:12px;"></span>
+      </div>
+      <h4>Files (${data.files.length})</h4>
+      <div class="cache-files-list">
+        ${data.files.map(f => {
+          const upd = updateMap[f.name];
+          const hasUpdate = upd?.hasUpdate === true;
+          return `
+          <div class="cache-file-row">
+            <input type="checkbox" class="cache-file-check" value="${escapeHtml(f.name)}" onchange="updateCacheFileSelection()">
+            <span class="cache-file-name" title="${escapeHtml(f.name)}">
+              ${f.isLfs ? '<span class="lfs-badge">LFS</span>' : ''}
+              ${escapeHtml(f.name)}
+            </span>
+            <span class="cache-file-size">${escapeHtml(f.sizeHuman)}</span>
+            ${hasUpdate ? updateIcon : ''}
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  }
+
   window.showCacheDetails = async function(repo, type) {
+    // Reset modal-level update-check state whenever a new modal is opened
+    currentModalRepo = repo;
+    currentModalType = type;
+    currentModalData = null;
+    currentUpdateCheck = null;
+
     try {
       showModal('Repository Details', '<div class="loading-state"><div class="spinner"></div></div>');
       const data = await api('GET', `/cache/${repo}`);
+      currentModalData = data;
+
+      // Carry over any previously-fetched update-check result for this repo
+      const updateKey = `${repo}:${type}`;
+      if (cacheUpdateResults[updateKey]) {
+        currentUpdateCheck = cacheUpdateResults[updateKey];
+      }
 
       const typeIcon = data.type === 'model'
         ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
@@ -1365,25 +1455,6 @@
              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
              <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
            </svg>`;
-
-      // Build files table
-      const filesHtml = data.files?.length > 0
-        ? `<div class="cache-detail-files">
-             <h4>Files (${data.files.length})</h4>
-             <div class="cache-files-list">
-               ${data.files.slice(0, 20).map(f => `
-                 <div class="cache-file-row">
-                   <span class="cache-file-name" title="${escapeHtml(f.name)}">
-                     ${f.isLfs ? '<span class="lfs-badge">LFS</span>' : ''}
-                     ${escapeHtml(f.name)}
-                   </span>
-                   <span class="cache-file-size">${escapeHtml(f.sizeHuman)}</span>
-                 </div>
-               `).join('')}
-               ${data.files.length > 20 ? `<div class="cache-files-more">... and ${data.files.length - 20} more files</div>` : ''}
-             </div>
-           </div>`
-        : '';
 
       // Build download status badge for detail view
       let statusBadgeHtml = '';
@@ -1482,29 +1553,187 @@
             </div>
           </div>
 
-          ${filesHtml}
+          <div id="modalFilesSection">
+            ${renderModalFiles(data, currentUpdateCheck)}
+          </div>
 
           <div class="cache-detail-actions">
-            <button class="btn btn-danger" onclick="confirmDeleteCache('${escapeHtml(data.repo)}', '${escapeHtml(data.type)}')">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
-              </svg>
-              Delete
-            </button>
-            <a href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${data.repo}" target="_blank" class="btn btn-secondary">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-                <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
-              </svg>
-              View on HuggingFace
-            </a>
-            <button class="btn btn-ghost" onclick="hideModal()">Close</button>
+            <div class="cache-detail-actions-row cache-detail-actions-selection">
+              <button id="updateSelectedFilesBtn" class="btn btn-primary" style="display:none"
+                onclick="updateSelectedCacheFiles('${escapeHtml(data.repo)}', '${escapeHtml(data.type)}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+                  <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+                </svg>
+                <span class="btn-label">Update Selected</span>
+              </button>
+              <button id="deleteSelectedFilesBtn" class="btn btn-danger" style="display:none"
+                onclick="deleteSelectedCacheFiles('${escapeHtml(data.repo)}', '${escapeHtml(data.type)}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                </svg>
+                Delete Selected
+              </button>
+            </div>
+            <div class="cache-detail-actions-row cache-detail-actions-primary">
+              <button id="checkModalUpdatesBtn" class="btn btn-secondary"
+                onclick="checkModalUpdates()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
+                  <path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
+                </svg>
+                Check for Updates
+              </button>
+              <a href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${data.repo}" target="_blank" class="btn btn-secondary">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                  <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+                </svg>
+                View on HuggingFace
+              </a>
+              <div class="cache-detail-actions-spacer"></div>
+              <button class="btn btn-danger" onclick="confirmDeleteCache('${escapeHtml(data.repo)}', '${escapeHtml(data.type)}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                  <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+                </svg>
+                Delete Repo
+              </button>
+              <button class="btn btn-ghost" onclick="hideModal()">Close</button>
+            </div>
           </div>
         </div>
       `);
     } catch (e) {
       setModalContent(`<p style="color: var(--color-error);">${escapeHtml(e.message)}</p>`);
+    }
+  };
+
+  // Check for upstream updates for a single repo (called from per-card button or "Check All").
+  window.checkRepoUpdates = async function(repo, type, silent) {
+    const updateKey = `${repo}:${type}`;
+    const safeBtnId = 'updBtn-' + updateKey.replace(/[^a-z0-9]/gi, '_');
+    const btn = document.getElementById(safeBtnId);
+
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<div class="spinner" style="width:13px;height:13px;"></div>`;
+    }
+
+    try {
+      const result = await api('GET', `/cache/${repo}/updates?type=${type}`);
+      cacheUpdateResults[updateKey] = result;
+      // If the detail modal is open for this repo, refresh the file section too
+      if (currentModalRepo === repo && currentModalType === type) {
+        currentUpdateCheck = result;
+        const filesSection = document.getElementById('modalFilesSection');
+        if (filesSection && currentModalData) {
+          filesSection.innerHTML = renderModalFiles(currentModalData, currentUpdateCheck);
+          updateCacheFileSelection();
+        }
+        // Update the "Check for Updates" button in modal to reflect result
+        const modalCheckBtn = document.getElementById('checkModalUpdatesBtn');
+        if (modalCheckBtn) {
+          if (result.updatedFiles > 0) {
+            modalCheckBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg> ${result.updatedFiles} update${result.updatedFiles !== 1 ? 's' : ''} available`;
+          } else {
+            modalCheckBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> Up to date`;
+          }
+        }
+      }
+      // Re-render the overview list to show updated badges
+      renderCacheList();
+      if (!silent) {
+        if (result.updatedFiles > 0) {
+          showToast(`${repo}: ${result.updatedFiles} file${result.updatedFiles !== 1 ? 's' : ''} have upstream updates`, 'warning');
+        } else if (result.commitChanged) {
+          showToast(`${repo}: new upstream commit available`, 'info');
+        } else {
+          showToast(`${repo}: all cached files are up to date`, 'success');
+        }
+      }
+    } catch (e) {
+      if (!silent) showToast(`Update check failed for ${repo}: ${e.message}`, 'error');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
+          <path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
+          <path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
+        </svg>`;
+      }
+    }
+  };
+
+  // Check for updates for all visible repos, one at a time.
+  async function checkAllUpdates() {
+    const btn = $('#checkAllUpdatesBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<div class="spinner" style="width:18px;height:18px;"></div> Checking...`;
+    }
+
+    const repos = cacheData.repos || [];
+    for (const repo of repos) {
+      await checkRepoUpdates(repo.repo, repo.type, /* silent */ true);
+    }
+
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+        <path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
+        <path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
+      </svg> Check Updates`;
+    }
+
+    const totalUpdates = Object.values(cacheUpdateResults).reduce((n, r) => n + (r.updatedFiles || 0), 0);
+    if (totalUpdates > 0) {
+      showToast(`${totalUpdates} file update${totalUpdates !== 1 ? 's' : ''} available across all repos`, 'warning');
+    } else {
+      showToast('All cached repos are up to date', 'success');
+    }
+  }
+
+  // Called from the "Check for Updates" button inside the detail modal.
+  window.checkModalUpdates = async function() {
+    if (!currentModalRepo || !currentModalType) return;
+    const btn = document.getElementById('checkModalUpdatesBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<div class="spinner" style="width:16px;height:16px;"></div> Checking...`;
+    }
+
+    try {
+      const result = await api('GET', `/cache/${currentModalRepo}/updates?type=${currentModalType}`);
+      currentUpdateCheck = result;
+      cacheUpdateResults[`${currentModalRepo}:${currentModalType}`] = result;
+
+      // Re-render file section with update icons
+      const filesSection = document.getElementById('modalFilesSection');
+      if (filesSection && currentModalData) {
+        filesSection.innerHTML = renderModalFiles(currentModalData, currentUpdateCheck);
+        updateCacheFileSelection();
+      }
+
+      // Update button to reflect result
+      if (btn) {
+        if (result.updatedFiles > 0) {
+          btn.disabled = false;
+          btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg> ${result.updatedFiles} update${result.updatedFiles !== 1 ? 's' : ''} available`;
+        } else {
+          btn.disabled = false;
+          btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> Up to date`;
+        }
+      }
+
+      // Also refresh overview badges
+      renderCacheList();
+    } catch (e) {
+      showToast(`Update check failed: ${e.message}`, 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg> Check for Updates`;
+      }
     }
   };
 
@@ -1580,6 +1809,84 @@
     }
   }
 
+  // Prune stale/orphaned files from the cache
+  async function pruneCache() {
+    const btn = $('#pruneCacheBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `
+        <div class="spinner" style="width: 18px; height: 18px;"></div>
+        Pruning...
+      `;
+    }
+
+    try {
+      const result = await api('POST', '/cache/prune');
+
+      showModal('Prune Complete', `
+        <div class="rebuild-result">
+          <div class="rebuild-success">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="48" height="48">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+              <polyline points="22 4 12 14.01 9 11.01"/>
+            </svg>
+          </div>
+          <p class="rebuild-message">${escapeHtml(result.message)}</p>
+          <div class="rebuild-stats">
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${result.reposScanned}</span>
+              <span class="rebuild-stat-label">Repos Scanned</span>
+            </div>
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${result.incompleteRemoved}</span>
+              <span class="rebuild-stat-label">Incomplete</span>
+            </div>
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${result.tempRemoved}</span>
+              <span class="rebuild-stat-label">Temp Files</span>
+            </div>
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${result.orphanedRemoved}</span>
+              <span class="rebuild-stat-label">Orphaned Blobs</span>
+            </div>
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${escapeHtml(result.spaceFreedHuman)}</span>
+              <span class="rebuild-stat-label">Space Freed</span>
+            </div>
+          </div>
+          ${result.errors?.length > 0 ? `
+            <div class="rebuild-errors">
+              <h5>Errors:</h5>
+              <ul>${result.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul>
+            </div>
+          ` : ''}
+          <div class="form-actions" style="margin-top: 20px;">
+            <button class="btn btn-primary" onclick="hideModal()">Done</button>
+          </div>
+        </div>
+      `);
+
+      loadCache();
+    } catch (e) {
+      if (e.status === 409) {
+        showToast('Cannot prune while downloads are active. Please wait or cancel them first.', 'warning');
+      } else {
+        showToast(`Prune failed: ${e.message}`, 'error');
+      }
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+            <path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+          </svg>
+          Prune
+        `;
+      }
+    }
+  }
+
   // Delete a cached repo with confirmation
   window.confirmDeleteCache = function(repo, type) {
     showModal('Delete from Cache', `
@@ -1623,6 +1930,12 @@
 
     // Rebuild button
     $('#rebuildCacheBtn')?.addEventListener('click', rebuildCache);
+
+    // Prune button
+    $('#pruneCacheBtn')?.addEventListener('click', pruneCache);
+
+    // Check all updates button
+    $('#checkAllUpdatesBtn')?.addEventListener('click', checkAllUpdates);
 
     // Search
     const searchInput = $('#cacheSearch');
@@ -2650,6 +2963,280 @@
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
   }
+
+  // =========================================
+  // File Browser (Analyze Page)
+  // =========================================
+
+  let _fileBrowserTree = null;
+
+  function buildFileTree(files) {
+    const rootFiles = [];
+    const dirs = {};
+    let dirIdx = 0;
+    for (const f of (files || [])) {
+      const slash = f.path.indexOf('/');
+      if (slash === -1) {
+        rootFiles.push(f);
+      } else {
+        const dir = f.path.slice(0, slash);
+        if (!dirs[dir]) dirs[dir] = { files: [], totalSize: 0, id: 'fbdir' + dirIdx++ };
+        dirs[dir].files.push(f);
+        dirs[dir].totalSize += f.size || 0;
+      }
+    }
+    return { rootFiles, dirs };
+  }
+
+  function renderFileBrowser(files) {
+    if (!files || files.length === 0) {
+      return '<div class="analysis-file" style="justify-content:center;color:var(--color-text-muted);">No files</div>';
+    }
+    _fileBrowserTree = buildFileTree(files);
+
+    const fileIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" style="flex-shrink:0;color:var(--color-text-muted)"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>`;
+    const folderIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" style="flex-shrink:0;color:var(--color-accent)"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+    const chevron = (id) => `<svg id="fb-chevron-${id}" class="fb-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="12" height="12"><polyline points="9 18 15 12 9 6"/></svg>`;
+
+    let html = '<div class="file-browser">';
+
+    for (const f of _fileBrowserTree.rootFiles) {
+      html += `
+        <div class="fb-row">
+          <input type="checkbox" class="fb-checkbox fb-file-root-checkbox" value="${escapeHtml(f.path)}" onchange="updateCLICommand()">
+          <span style="width:12px;flex-shrink:0;"></span>
+          ${fileIcon}
+          <span class="fb-name" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</span>
+          <span class="fb-size">${f.size_human || formatBytes(f.size)}</span>
+        </div>`;
+    }
+
+    for (const [dir, info] of Object.entries(_fileBrowserTree.dirs)) {
+      const id = info.id;
+      html += `
+        <div class="fb-row fb-dir-row" onclick="toggleFileBrowserDir(event,'${escapeHtml(dir)}','${id}')">
+          <input type="checkbox" class="fb-checkbox fb-dir-checkbox" id="fb-check-${id}"
+                 value="${escapeHtml(dir)}"
+                 onclick="event.stopPropagation()"
+                 onchange="onFileBrowserDirCheck(this,'${escapeHtml(dir)}','${id}')">
+          ${chevron(id)}
+          ${folderIcon}
+          <span class="fb-name fb-dir-name" title="${escapeHtml(dir)}">${escapeHtml(dir)}/</span>
+          <span class="fb-meta">${info.files.length} file${info.files.length !== 1 ? 's' : ''} &middot; ${formatBytes(info.totalSize)}</span>
+        </div>
+        <div class="fb-dir-contents" id="fb-contents-${id}" style="display:none;"></div>`;
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  window.toggleFileBrowserDir = function(event, dir, id) {
+    const contents = document.getElementById('fb-contents-' + id);
+    const chev = document.getElementById('fb-chevron-' + id);
+    if (!contents) return;
+
+    const isOpen = contents.style.display !== 'none';
+    if (!isOpen) {
+      if (!contents.dataset.rendered) {
+        const dirData = _fileBrowserTree.dirs[dir];
+        const dirCheck = document.getElementById('fb-check-' + id);
+        const allChecked = dirCheck && dirCheck.checked;
+        const fileIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" style="flex-shrink:0;color:var(--color-text-muted)"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>`;
+        contents.innerHTML = dirData.files.map(f => `
+          <div class="fb-row">
+            <input type="checkbox" class="fb-checkbox fb-file-checkbox" value="${escapeHtml(f.path)}"
+                   ${allChecked ? 'checked' : ''}
+                   onchange="onFileBrowserFileCheck(this,'${escapeHtml(dir)}','${id}')">
+            <span style="width:12px;flex-shrink:0;"></span>
+            ${fileIcon}
+            <span class="fb-name" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</span>
+            <span class="fb-size">${f.size_human || formatBytes(f.size)}</span>
+          </div>`).join('');
+        contents.dataset.rendered = '1';
+      }
+      contents.style.display = 'block';
+      if (chev) chev.classList.add('open');
+    } else {
+      contents.style.display = 'none';
+      if (chev) chev.classList.remove('open');
+    }
+  };
+
+  window.onFileBrowserDirCheck = function(checkbox, dir, id) {
+    const contents = document.getElementById('fb-contents-' + id);
+    if (contents && contents.dataset.rendered) {
+      contents.querySelectorAll('.fb-file-checkbox').forEach(cb => {
+        cb.checked = checkbox.checked;
+        cb.indeterminate = false;
+      });
+    }
+    updateCLICommand();
+  };
+
+  window.onFileBrowserFileCheck = function(checkbox, dir, id) {
+    const contents = document.getElementById('fb-contents-' + id);
+    const dirCheckbox = document.getElementById('fb-check-' + id);
+    if (!contents || !dirCheckbox) return;
+
+    const all = Array.from(contents.querySelectorAll('.fb-file-checkbox'));
+    const checked = all.filter(cb => cb.checked).length;
+    if (checked === 0) {
+      dirCheckbox.checked = false;
+      dirCheckbox.indeterminate = false;
+    } else if (checked === all.length) {
+      dirCheckbox.checked = true;
+      dirCheckbox.indeterminate = false;
+    } else {
+      dirCheckbox.checked = false;
+      dirCheckbox.indeterminate = true;
+    }
+    updateCLICommand();
+  };
+
+  // Collect filter values from the file browser checkboxes
+  function getFileBrowserFilters() {
+    if (!_fileBrowserTree) return [];
+    const filters = [];
+
+    document.querySelectorAll('.fb-file-root-checkbox:checked').forEach(cb => filters.push(cb.value));
+
+    for (const [dir, info] of Object.entries(_fileBrowserTree.dirs)) {
+      const id = info.id;
+      const dirCheckbox = document.getElementById('fb-check-' + id);
+      const contents = document.getElementById('fb-contents-' + id);
+      const isExpanded = contents && contents.style.display !== 'none';
+
+      if (isExpanded && contents.dataset.rendered) {
+        contents.querySelectorAll('.fb-file-checkbox:checked').forEach(cb => filters.push(cb.value));
+      } else if (dirCheckbox && dirCheckbox.checked) {
+        filters.push(dir);
+      }
+    }
+    return filters;
+  }
+
+  // Update the CLI command preview based on current selections
+  function updateCLICommand() {
+    if (!currentAnalysis) return;
+    let cmd = `hfdownloader download ${currentAnalysis.repo}`;
+    if (currentAnalysis.is_dataset) cmd += ' --dataset';
+    if (currentAnalysis.branch && currentAnalysis.branch !== 'main') cmd += ` -b ${currentAnalysis.branch}`;
+
+    const filters = getFileBrowserFilters();
+    if (filters.length > 0) {
+      cmd += ` -F "${filters.join(',')}"`;
+    } else if (advancedOptions.filter) {
+      cmd += ` -F "${advancedOptions.filter}"`;
+    }
+    if (advancedOptions.exclude) cmd += ` -e "${advancedOptions.exclude}"`;
+
+    const cmdEl = $('#cliCommandText');
+    if (cmdEl) cmdEl.textContent = cmd;
+    const legacyCmd = $('#downloadCommand');
+    if (legacyCmd) legacyCmd.textContent = cmd;
+  }
+
+  // =========================================
+  // Cache File Deletion
+  // =========================================
+
+  window.toggleAllCacheFiles = function(selectAllCb) {
+    document.querySelectorAll('.cache-file-check').forEach(cb => { cb.checked = selectAllCb.checked; });
+    updateCacheFileSelection();
+  };
+
+  window.updateCacheFileSelection = function() {
+    const all = document.querySelectorAll('.cache-file-check');
+    const checked = document.querySelectorAll('.cache-file-check:checked');
+    const countEl = $('#cacheFileSelectedCount');
+    const deleteBtn = $('#deleteSelectedFilesBtn');
+    const updateBtn = $('#updateSelectedFilesBtn');
+    const selectAllCb = $('#cacheFileSelectAll');
+    const selectionRow = document.querySelector('.cache-detail-actions-selection');
+
+    if (countEl) countEl.textContent = checked.length > 0 ? `${checked.length} selected` : '';
+    if (deleteBtn) deleteBtn.style.display = checked.length > 0 ? '' : 'none';
+    if (selectAllCb) {
+      selectAllCb.checked = all.length > 0 && checked.length === all.length;
+      selectAllCb.indeterminate = checked.length > 0 && checked.length < all.length;
+    }
+
+    // Show "Update Selected" only when update check has been done AND at least one
+    // selected file actually has an update available (prevents unnecessary downloads).
+    if (updateBtn) {
+      let updatableCount = 0;
+      if (currentUpdateCheck?.files && checked.length > 0) {
+        const updateMap = {};
+        for (const f of currentUpdateCheck.files) updateMap[f.name] = f;
+        checked.forEach(cb => {
+          if (updateMap[cb.value]?.hasUpdate) updatableCount++;
+        });
+      }
+      updateBtn.style.display = updatableCount > 0 ? '' : 'none';
+      if (updatableCount > 0) {
+        updateBtn.querySelector('svg').nextSibling.textContent = ` Update Selected (${updatableCount})`;
+      }
+    }
+
+    // Show/hide the selection row based on whether any selection button is visible
+    if (selectionRow) {
+      const anyVisible = (deleteBtn && deleteBtn.style.display !== 'none') ||
+                         (updateBtn && updateBtn.style.display !== 'none');
+      selectionRow.style.display = anyVisible ? 'flex' : 'none';
+    }
+  };
+
+  window.deleteSelectedCacheFiles = async function(repo, type) {
+    const selected = Array.from(document.querySelectorAll('.cache-file-check:checked')).map(cb => cb.value);
+    if (selected.length === 0) return;
+    if (!confirm(`Delete ${selected.length} file(s) from ${repo}?\nThis cannot be undone.`)) return;
+
+    try {
+      await api('DELETE', `/cache/${repo}/files`, { files: selected, type });
+      hideModal();
+      showToast(`Deleted ${selected.length} file(s) from ${repo}`, 'success');
+      loadCache();
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  };
+
+  // Update selected files — only re-downloads files that actually have upstream changes.
+  // Files that are already current are silently excluded before the job is queued,
+  // so no bandwidth is wasted even if the user has selected them.
+  window.updateSelectedCacheFiles = async function(repo, type) {
+    const selected = Array.from(document.querySelectorAll('.cache-file-check:checked')).map(cb => cb.value);
+    if (selected.length === 0) return;
+
+    // Filter to only files that need an update
+    let toUpdate = selected;
+    if (currentUpdateCheck?.files) {
+      const updateMap = {};
+      for (const f of currentUpdateCheck.files) updateMap[f.name] = f;
+      toUpdate = selected.filter(name => updateMap[name]?.hasUpdate === true);
+    }
+
+    if (toUpdate.length === 0) {
+      showToast('All selected files are already up to date — nothing to download', 'info');
+      return;
+    }
+
+    if (!confirm(`Queue update for ${toUpdate.length} file(s) in ${repo}?`)) return;
+
+    try {
+      const result = await api('POST', '/download', {
+        repo,
+        dataset: type === 'dataset',
+        paths: toUpdate,
+      });
+      hideModal();
+      showToast(`Update job started for ${toUpdate.length} file(s) in ${repo}`, 'success');
+      navigateTo('jobs');
+    } catch (e) {
+      showToast(`Failed to start update: ${e.message}`, 'error');
+    }
+  };
 
   // =========================================
   // Initialize

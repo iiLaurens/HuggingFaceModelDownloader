@@ -27,6 +27,7 @@ type Config struct {
 	Concurrency        int
 	MaxActive          int
 	MultipartThreshold string // Minimum size for multipart download
+	PartSize           string // Size of each part in multipart downloads
 	Verify             string // Verification mode: none, size, sha256
 	Retries            int    // Number of retry attempts
 	AllowedOrigins     []string // CORS origins
@@ -50,6 +51,7 @@ func DefaultConfig() Config {
 		Concurrency:        8,
 		MaxActive:          3,
 		MultipartThreshold: "32MiB",
+		PartSize:           "32MiB",
 		Verify:             "size",
 		Retries:            4,
 	}
@@ -180,9 +182,12 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 
 	// Cache browser
 	mux.HandleFunc("GET /api/cache", s.handleCacheList)
+	mux.HandleFunc("GET /api/cache/{owner}/{name}/updates", s.handleCacheUpdates)
 	mux.HandleFunc("GET /api/cache/{repo...}", s.handleCacheInfo)
 	mux.HandleFunc("POST /api/cache/rebuild", s.handleCacheRebuild)
-	mux.HandleFunc("DELETE /api/cache/{repo...}", s.handleCacheDelete)
+	mux.HandleFunc("POST /api/cache/prune", s.handleCachePrune)
+	mux.HandleFunc("DELETE /api/cache/{owner}/{name}/files", s.handleCacheDeleteFiles)
+	mux.HandleFunc("DELETE /api/cache/{owner}/{name}", s.handleCacheDelete)
 
 	// Mirror - Target management
 	mux.HandleFunc("GET /api/mirror/targets", s.handleMirrorTargetsList)

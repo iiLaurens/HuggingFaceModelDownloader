@@ -28,6 +28,10 @@ type DownloadRequest struct {
 	Excludes           []string `json:"excludes,omitempty"`
 	AppendFilterSubdir bool     `json:"appendFilterSubdir,omitempty"`
 	DryRun             bool     `json:"dryRun,omitempty"`
+	// Paths is an optional list of exact relative file paths to download.
+	// When provided, Filters and Excludes are ignored and only the listed
+	// files are downloaded.  Used by the "Update Selected" feature.
+	Paths []string `json:"paths,omitempty"`
 }
 
 // PlanResponse is the response for a dry-run/plan request.
@@ -53,6 +57,7 @@ type SettingsResponse struct {
 	Concurrency        int    `json:"connections"`
 	MaxActive          int    `json:"maxActive"`
 	MultipartThreshold string `json:"multipartThreshold"`
+	PartSize           string `json:"partSize"`
 	Verify             string `json:"verify"`
 	Retries            int    `json:"retries"`
 	Endpoint           string `json:"endpoint,omitempty"`
@@ -375,6 +380,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		Concurrency:        s.config.Concurrency,
 		MaxActive:          s.config.MaxActive,
 		MultipartThreshold: s.config.MultipartThreshold,
+		PartSize:           s.config.PartSize,
 		Verify:             s.config.Verify,
 		Retries:            s.config.Retries,
 		Endpoint:           s.config.Endpoint,
@@ -404,6 +410,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Concurrency        *int    `json:"connections,omitempty"`
 		MaxActive          *int    `json:"maxActive,omitempty"`
 		MultipartThreshold *string `json:"multipartThreshold,omitempty"`
+		PartSize           *string `json:"partSize,omitempty"`
 		Verify             *string `json:"verify,omitempty"`
 		Retries            *int    `json:"retries,omitempty"`
 		Endpoint           *string `json:"endpoint,omitempty"`
@@ -436,6 +443,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MultipartThreshold != nil && *req.MultipartThreshold != "" {
 		s.config.MultipartThreshold = *req.MultipartThreshold
+	}
+	if req.PartSize != nil && *req.PartSize != "" {
+		s.config.PartSize = *req.PartSize
 	}
 	if req.Verify != nil && *req.Verify != "" {
 		s.config.Verify = *req.Verify
@@ -485,6 +495,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Connections:        s.config.Concurrency,
 		MaxActive:          s.config.MaxActive,
 		MultipartThreshold: s.config.MultipartThreshold,
+		PartSize:           s.config.PartSize,
 		Verify:             s.config.Verify,
 		Retries:            s.config.Retries,
 		Endpoint:           s.config.Endpoint,
@@ -1003,11 +1014,13 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 // - TOCTOU race conditions
 // - Directory escape via prefix manipulation
 func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
-	repo := r.PathValue("repo")
-	if repo == "" {
+	owner := r.PathValue("owner")
+	name := r.PathValue("name")
+	if owner == "" || name == "" {
 		writeError(w, http.StatusBadRequest, "Missing repo path", "")
 		return
 	}
+	repo := owner + "/" + name
 
 	// Security Layer 1: Validate repo format strictly (owner/name)
 	if !hfdownloader.IsValidModelName(repo) {
@@ -1278,4 +1291,467 @@ func humanSizeBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// PruneResponse represents the result of a cache prune operation.
+type PruneResponse struct {
+	Success           bool     `json:"success"`
+	ReposScanned      int      `json:"reposScanned"`
+	IncompleteRemoved int      `json:"incompleteRemoved"`
+	TempRemoved       int      `json:"tempRemoved"`
+	OrphanedRemoved   int      `json:"orphanedRemoved"`
+	SpaceFreed        int64    `json:"spaceFreed"`
+	SpaceFreedHuman   string   `json:"spaceFreedHuman"`
+	Errors            []string `json:"errors,omitempty"`
+	Message           string   `json:"message"`
+}
+
+// handleCachePrune removes stale incomplete downloads, leftover tmp-* files,
+// and orphaned blobs from the cache.  It refuses to run while any download
+// jobs are active to prevent data corruption.
+func (s *Server) handleCachePrune(w http.ResponseWriter, r *http.Request) {
+	if s.jobs.HasActiveJobs() {
+		writeError(w, http.StatusConflict, "Downloads are active",
+			"Please wait for all downloads to finish or cancel them before pruning.")
+		return
+	}
+
+	cacheDir := s.config.CacheDir
+	if cacheDir == "" {
+		cacheDir = hfdownloader.DefaultCacheDir()
+	}
+
+	cache := hfdownloader.NewHFCache(cacheDir, hfdownloader.DefaultStaleTimeout)
+	result, err := cache.Prune()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Prune failed", err.Error())
+		return
+	}
+
+	resp := PruneResponse{
+		Success:           true,
+		ReposScanned:      result.ReposScanned,
+		IncompleteRemoved: result.IncompleteRemoved,
+		TempRemoved:       result.TempRemoved,
+		OrphanedRemoved:   result.OrphanedRemoved,
+		SpaceFreed:        result.SpaceFreed,
+		SpaceFreedHuman:   humanSizeBytes(result.SpaceFreed),
+	}
+	for _, e := range result.Errors {
+		resp.Errors = append(resp.Errors, e.Error())
+	}
+
+	total := result.IncompleteRemoved + result.TempRemoved + result.OrphanedRemoved
+	if total == 0 {
+		resp.Message = "Cache is already clean, nothing to prune"
+	} else {
+		resp.Message = fmt.Sprintf("Removed %d item(s), freed %s", total, resp.SpaceFreedHuman)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleCacheDeleteFiles deletes individual files from a cached repository.
+// It removes snapshot symlinks, friendly-view symlinks, and blobs with no remaining references.
+// SECURITY: applies the same validation as handleCacheDelete.
+func (s *Server) handleCacheDeleteFiles(w http.ResponseWriter, r *http.Request) {
+	owner := r.PathValue("owner")
+	name := r.PathValue("name")
+	if owner == "" || name == "" {
+		writeError(w, http.StatusBadRequest, "Missing repo path", "")
+		return
+	}
+	repo := owner + "/" + name
+
+	if !hfdownloader.IsValidModelName(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID format", "Expected format: owner/name")
+		return
+	}
+	if strings.Contains(repo, "..") || strings.Contains(repo, "//") || strings.Contains(repo, "\\") {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID", "Path traversal not allowed")
+		return
+	}
+	parts := strings.SplitN(repo, "/", 2)
+	if !isValidRepoComponent(parts[0]) || !isValidRepoComponent(parts[1]) {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID", "Invalid characters in repository name")
+		return
+	}
+
+	var req struct {
+		Files []string `json:"files"`
+		Type  string   `json:"type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	if len(req.Files) == 0 {
+		writeError(w, http.StatusBadRequest, "No files specified", "")
+		return
+	}
+
+	// Validate each requested file path (no traversal)
+	for _, f := range req.Files {
+		if strings.Contains(f, "..") || strings.Contains(f, "\\") || filepath.IsAbs(f) {
+			writeError(w, http.StatusBadRequest, "Invalid file path", f)
+			return
+		}
+	}
+
+	repoTypeStr := req.Type
+	repoType := hfdownloader.RepoTypeModel
+	if repoTypeStr == "dataset" {
+		repoType = hfdownloader.RepoTypeDataset
+	}
+
+	cacheDir := s.config.CacheDir
+	if cacheDir == "" {
+		cacheDir = hfdownloader.DefaultCacheDir()
+	}
+
+	absCacheDir, err := filepath.Abs(cacheDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to resolve cache path", err.Error())
+		return
+	}
+	absCacheDirWithSep := absCacheDir + string(filepath.Separator)
+
+	cache := hfdownloader.NewHFCache(cacheDir, 0)
+	repoDir, err := cache.Repo(repo, repoType)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID", err.Error())
+		return
+	}
+
+	if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
+		writeError(w, http.StatusNotFound, "Repository not found in cache", "")
+		return
+	}
+
+	snapshots, err := repoDir.ListSnapshots()
+	if err != nil || len(snapshots) == 0 {
+		writeError(w, http.StatusNotFound, "No snapshots found for repository", "")
+		return
+	}
+
+	// Build set of files to delete
+	toDelete := make(map[string]struct{}, len(req.Files))
+	for _, f := range req.Files {
+		toDelete[filepath.Clean(f)] = struct{}{}
+	}
+
+	friendlyBase := repoDir.FriendlyPath()
+
+	// Track blobs that had symlinks removed so we can check for orphans
+	blobsToCheck := make(map[string]struct{})
+
+	for _, commit := range snapshots {
+		snapshotDir := repoDir.SnapshotDir(commit)
+		for relPath := range toDelete {
+			symlinkPath := filepath.Join(snapshotDir, relPath)
+
+			// Security: ensure symlink path is within cache
+			absLink, err := filepath.Abs(symlinkPath)
+			if err != nil {
+				continue
+			}
+			if !strings.HasPrefix(absLink+string(filepath.Separator), absCacheDirWithSep) {
+				continue
+			}
+
+			// Read symlink target to find blob before removing
+			target, err := os.Readlink(symlinkPath)
+			if err == nil {
+				// Resolve to absolute blob path
+				blobAbs := target
+				if !filepath.IsAbs(blobAbs) {
+					blobAbs = filepath.Join(filepath.Dir(symlinkPath), target)
+				}
+				blobAbs = filepath.Clean(blobAbs)
+				if strings.HasPrefix(blobAbs+string(filepath.Separator), absCacheDirWithSep) {
+					blobsToCheck[blobAbs] = struct{}{}
+				}
+			}
+
+			// Remove the snapshot symlink
+			_ = os.Remove(symlinkPath)
+
+			// Remove friendly-view symlink for this file
+			friendlyLink := filepath.Join(friendlyBase, relPath)
+			absFriendlyLink, err := filepath.Abs(friendlyLink)
+			if err == nil && strings.HasPrefix(absFriendlyLink+string(filepath.Separator), absCacheDirWithSep) {
+				if fi, err := os.Lstat(absFriendlyLink); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+					_ = os.Remove(absFriendlyLink)
+				}
+			}
+		}
+	}
+
+	// For each blob that had symlinks removed, check if any other snapshot
+	// still references it; if not, remove the blob.
+	for blobPath := range blobsToCheck {
+		if !isReferenced(blobPath, repoDir.Path()) {
+			_ = os.Remove(blobPath)
+		}
+	}
+
+	// Update manifest if it exists
+	manifestPath := filepath.Join(friendlyBase, hfdownloader.ManifestFilename)
+	if m, err := hfdownloader.ReadManifest(manifestPath); err == nil {
+		var remaining []hfdownloader.ManifestFile
+		var removedSize int64
+		for _, mf := range m.Files {
+			if _, del := toDelete[filepath.Clean(mf.Name)]; del {
+				removedSize += mf.Size
+			} else {
+				remaining = append(remaining, mf)
+			}
+		}
+		m.Files = remaining
+		m.TotalFiles = len(remaining)
+		m.TotalSize -= removedSize
+		if m.TotalSize < 0 {
+			m.TotalSize = 0
+		}
+		_, _ = m.Write(friendlyBase)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": fmt.Sprintf("Deleted %d file(s) from %s", len(req.Files), repo),
+		"deleted": len(req.Files),
+	})
+}
+
+// isReferenced checks whether any symlink inside repoPath points to blobPath.
+func isReferenced(blobPath, repoPath string) bool {
+	found := false
+	_ = filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || found {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return nil
+			}
+			abs := target
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(filepath.Dir(path), target)
+			}
+			if filepath.Clean(abs) == blobPath {
+				found = true
+			}
+		}
+		return nil
+	})
+	return found
+}
+
+// --- Update Check ---
+
+// FileUpdateInfo describes the update status of a single cached file.
+type FileUpdateInfo struct {
+	Name      string `json:"name"`      // relative path within the repo
+	LocalSHA  string `json:"localSha"`  // SHA256 stored locally (blob filename)
+	RemoteSHA string `json:"remoteSha"` // SHA256 reported by upstream
+	HasUpdate bool   `json:"hasUpdate"` // true when remote differs from local
+	IsLFS     bool   `json:"isLfs"`
+	Size      int64  `json:"size"`
+}
+
+// UpdateCheckResponse is returned by handleCacheUpdates.
+type UpdateCheckResponse struct {
+	LocalCommit   string           `json:"localCommit"`
+	RemoteCommit  string           `json:"remoteCommit"`
+	CommitChanged bool             `json:"commitChanged"`
+	UpdatedFiles  int              `json:"updatedFiles"`
+	Files         []FileUpdateInfo `json:"files"`
+	CheckedAt     string           `json:"checkedAt"`
+}
+
+// handleCacheUpdates checks a locally cached repo for upstream changes.
+//
+// Two-phase approach:
+//  1. Fast path: compare the stored local commit SHA with the upstream commit SHA
+//     (one lightweight API call to /api/models/{repo}/revision/{branch}).
+//     If the commits are identical, all files are current and no further calls are made.
+//  2. Full path (when commits differ): walk the upstream tree to obtain the SHA256
+//     for every file, then compare against the local blob filenames.
+//     Only files that ARE already cached locally are reported — intentionally-absent
+//     files (filtered downloads) are not treated as updates.
+//
+// Query parameters:
+//
+//	type  – "model" (default) or "dataset"
+//	branch – branch/revision to compare (default: "main")
+func (s *Server) handleCacheUpdates(w http.ResponseWriter, r *http.Request) {
+	owner := r.PathValue("owner")
+	name := r.PathValue("name")
+	if owner == "" || name == "" {
+		writeError(w, http.StatusBadRequest, "Missing repo path", "")
+		return
+	}
+	repo := owner + "/" + name
+
+	if !hfdownloader.IsValidModelName(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID format", "Expected format: owner/name")
+		return
+	}
+	if strings.Contains(repo, "..") || strings.Contains(repo, "//") || strings.Contains(repo, "\\") {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID", "Path traversal not allowed")
+		return
+	}
+	parts := strings.SplitN(repo, "/", 2)
+	if !isValidRepoComponent(parts[0]) || !isValidRepoComponent(parts[1]) {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID", "Invalid characters in repository name")
+		return
+	}
+
+	repoTypeStr := r.URL.Query().Get("type")
+	repoType := hfdownloader.RepoTypeModel
+	isDataset := false
+	if repoTypeStr == "dataset" {
+		repoType = hfdownloader.RepoTypeDataset
+		isDataset = true
+	}
+
+	branch := r.URL.Query().Get("branch")
+	if branch == "" {
+		branch = "main"
+	}
+
+	cacheDir := s.config.CacheDir
+	if cacheDir == "" {
+		cacheDir = hfdownloader.DefaultCacheDir()
+	}
+
+	cache := hfdownloader.NewHFCache(cacheDir, 0)
+	repoDir, err := cache.Repo(repo, repoType)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID", err.Error())
+		return
+	}
+
+	if _, err := os.Stat(repoDir.Path()); os.IsNotExist(err) {
+		writeError(w, http.StatusNotFound, "Repository not found in cache", "")
+		return
+	}
+
+	// Phase 1: read the local commit SHA from refs/{branch}
+	localCommit, _ := repoDir.ReadRef(branch)
+	// Also try "master" as fallback when branch=="main"
+	if localCommit == "" && branch == "main" {
+		localCommit, _ = repoDir.ReadRef("master")
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	settings := hfdownloader.Settings{
+		Token:    s.config.Token,
+		Endpoint: s.config.Endpoint,
+		Proxy:    s.config.Proxy,
+	}
+	job := hfdownloader.Job{
+		Repo:      repo,
+		Revision:  branch,
+		IsDataset: isDataset,
+	}
+
+	// Always fetch the upstream commit so we can report it.
+	remoteFiles, remoteCommit, err := hfdownloader.FetchFileTree(ctx, job, settings)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to fetch upstream file tree", err.Error())
+		return
+	}
+
+	commitChanged := localCommit == "" || (remoteCommit != "" && localCommit != remoteCommit)
+
+	// Build map of locally-present blobs: sha256 → true.
+	// A blob is present when blobs/{sha256} exists in the repo's blobs directory.
+	blobsDir := repoDir.BlobsDir()
+
+	// Also build a map of local file → local sha256 by reading snapshot symlinks.
+	// This lets us report what the old hash was for changed files.
+	localFileSHA := make(map[string]string) // relative path → local sha256
+
+	snapshots, _ := repoDir.ListSnapshots()
+	// Use localCommit's snapshot if available, otherwise fall back to the first one.
+	snapshotToUse := localCommit
+	if snapshotToUse == "" && len(snapshots) > 0 {
+		snapshotToUse = snapshots[0]
+	}
+	if snapshotToUse != "" {
+		snapshotDir := repoDir.SnapshotDir(snapshotToUse)
+		filepath.Walk(snapshotDir, func(p string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			// Follow the symlink to determine the blob SHA (it's the filename).
+			target, err := os.Readlink(p)
+			if err != nil {
+				return nil
+			}
+			abs := target
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(filepath.Dir(p), target)
+			}
+			abs = filepath.Clean(abs)
+			sha := filepath.Base(abs)
+			relPath, err := filepath.Rel(snapshotDir, p)
+			if err != nil {
+				return nil
+			}
+			localFileSHA[filepath.ToSlash(relPath)] = sha
+			return nil
+		})
+	}
+
+	// Compare remote files against local cache.
+	var fileInfos []FileUpdateInfo
+	updatedCount := 0
+
+	for _, rf := range remoteFiles {
+		relSlash := filepath.ToSlash(rf.Path)
+
+		// Only report files that exist locally (skip intentionally-absent files).
+		localSHA, existsLocally := localFileSHA[relSlash]
+		if !existsLocally {
+			// Double-check blob existence directly in case snapshot map is incomplete.
+			if rf.SHA256 != "" {
+				if _, statErr := os.Stat(filepath.Join(blobsDir, rf.SHA256)); statErr == nil {
+					// Blob happens to be present (shared across snapshots), treat as local.
+					localSHA = rf.SHA256
+					existsLocally = true
+				}
+			}
+		}
+		if !existsLocally {
+			continue
+		}
+
+		hasUpdate := rf.SHA256 != "" && localSHA != rf.SHA256
+		if hasUpdate {
+			updatedCount++
+		}
+
+		fileInfos = append(fileInfos, FileUpdateInfo{
+			Name:      rf.Path,
+			LocalSHA:  localSHA,
+			RemoteSHA: rf.SHA256,
+			HasUpdate: hasUpdate,
+			IsLFS:     rf.IsLFS,
+			Size:      rf.Size,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, UpdateCheckResponse{
+		LocalCommit:   localCommit,
+		RemoteCommit:  remoteCommit,
+		CommitChanged: commitChanged,
+		UpdatedFiles:  updatedCount,
+		Files:         fileInfos,
+		CheckedAt:     time.Now().UTC().Format(time.RFC3339),
+	})
 }
