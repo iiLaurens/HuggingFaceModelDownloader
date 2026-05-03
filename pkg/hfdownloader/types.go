@@ -101,7 +101,7 @@ type Job struct {
 //
 //	cfg := hfdownloader.Settings{
 //	    CacheDir:           "~/.cache/huggingface",
-//	    Concurrency:        8,
+//	    Concurrency:        32,
 //	    MaxActiveDownloads: 4,
 //	    MultipartThreshold: "32MiB",
 //	    Verify:             "sha256",
@@ -309,7 +309,7 @@ func DefaultSettings() Settings {
 	return Settings{
 		CacheDir:           "", // Empty = use DefaultCacheDir()
 		StaleTimeout:       "5m",
-		Concurrency:        8,
+		Concurrency:        32,
 		MaxActiveDownloads: 4,
 		MultipartThreshold: "256MiB",
 		PartSize:           "32MiB",

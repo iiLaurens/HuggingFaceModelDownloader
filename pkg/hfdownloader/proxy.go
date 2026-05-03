@@ -110,7 +110,12 @@ func BuildHTTPClient(proxy *ProxyConfig) (*http.Client, error) {
 // buildHTTPProxyClient creates a client for HTTP/HTTPS proxies.
 func buildHTTPProxyClient(proxyCfg *ProxyConfig) (*http.Client, error) {
 	tr := &http.Transport{
-		MaxIdleConns:          64,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   128,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -206,7 +211,8 @@ func buildSOCKS5Client(proxyCfg *ProxyConfig) (*http.Client, error) {
 			// Use SOCKS5 proxy
 			return dialer.Dial(network, addr)
 		},
-		MaxIdleConns:          64,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   128,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,

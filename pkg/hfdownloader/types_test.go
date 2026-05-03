@@ -18,7 +18,7 @@ func TestDefaultSettings(t *testing.T) {
 	}{
 		{"CacheDir", cfg.CacheDir, ""},
 		{"StaleTimeout", cfg.StaleTimeout, "5m"},
-		{"Concurrency", cfg.Concurrency, 8},
+		{"Concurrency", cfg.Concurrency, 32},
 		{"MaxActiveDownloads", cfg.MaxActiveDownloads, 4},
 		{"MultipartThreshold", cfg.MultipartThreshold, "256MiB"},
 		{"Verify", cfg.Verify, "size"},

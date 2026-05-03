@@ -158,7 +158,7 @@ func newDownloadCmd(ctx context.Context, ro *RootOpts) *cobra.Command {
 	// Settings flags
 	cmd.Flags().StringVar(&cfg.CacheDir, "cache-dir", "", "HuggingFace cache directory (default: ~/.cache/huggingface or HF_HOME)")
 	cmd.Flags().StringVar(&cfg.StaleTimeout, "stale-timeout", "5m", "Timeout for stale incomplete downloads")
-	cmd.Flags().IntVarP(&cfg.Concurrency, "connections", "c", 8, "Per-file concurrent connections for LFS range requests")
+	cmd.Flags().IntVarP(&cfg.Concurrency, "connections", "c", 32, "Per-file concurrent connections for LFS range requests")
 	cmd.Flags().IntVar(&cfg.MaxActiveDownloads, "max-active", 3, "Maximum number of files downloading at once")
 	cmd.Flags().StringVar(&cfg.MultipartThreshold, "multipart-threshold", "32MiB", "Use multipart/range downloads only for files >= this size")
 	cmd.Flags().StringVar(&cfg.PartSize, "part-size", "32MiB", "Size of each part for multipart downloads (e.g. 8MiB, 32MiB, 128MiB)")
@@ -310,7 +310,7 @@ func buildCommandString(cmd *cobra.Command, job hfdownloader.Job, cfg hfdownload
 	} else if cfg.OutputDir == "Models" || cfg.OutputDir == "Datasets" {
 		parts = append(parts, "--legacy")
 	}
-	if cfg.Concurrency != 8 {
+	if cfg.Concurrency != 32 {
 		parts = append(parts, "-c", fmt.Sprintf("%d", cfg.Concurrency))
 	}
 	if cfg.MaxActiveDownloads != 3 {

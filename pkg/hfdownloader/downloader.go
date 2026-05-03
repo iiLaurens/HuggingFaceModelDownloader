@@ -636,10 +636,19 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		tmpParts[i] = fmt.Sprintf("%s.part-%02d", dst, i)
 	}
 
+	// Seed the progress counter with bytes already on disk from any previous
+	// interrupted run so the ticker reflects resumed progress immediately.
+	var downloadedBytes int64
+	for _, p := range tmpParts {
+		if fi, err := os.Stat(p); err == nil {
+			atomic.AddInt64(&downloadedBytes, fi.Size())
+		}
+	}
+
 	// Download parts in parallel, capped to cfg.Concurrency goroutines.
 	concurrency := cfg.Concurrency
 	if concurrency <= 0 {
-		concurrency = 8
+		concurrency = 32
 	}
 	if concurrency > numParts {
 		concurrency = numParts
@@ -698,8 +707,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			if pos == expected {
 				return
 			}
-			// Oversize (stale/corrupt) — reset.
+			// Oversize (stale/corrupt) — reset. Un-count the stale bytes that
+			// were included in the initial seed so the progress stays accurate.
 			if pos > expected {
+				atomic.AddInt64(&downloadedBytes, -pos)
 				if err := out.Truncate(0); err != nil {
 					select {
 					case errCh <- err:
@@ -738,7 +749,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 					lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
 					rs.Body.Close()
 				} else {
-					_, cerr := io.Copy(out, rs.Body)
+					// Count bytes as they arrive, so the progress ticker reflects
+					// in-flight data rather than only bytes flushed to disk.
+					cr := &countingReader{r: rs.Body, counter: &downloadedBytes}
+					_, cerr := io.Copy(out, cr)
 					rs.Body.Close()
 					if cerr == nil {
 						return
@@ -782,13 +796,7 @@ partsLaunched:
 			case <-tickerDone:
 				return
 			case <-t.C:
-				var downloaded int64
-				for _, p := range tmpParts {
-					if fi, err := os.Stat(p); err == nil {
-						downloaded += fi.Size()
-					}
-				}
-				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: downloaded, Total: it.Size})
+				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: atomic.LoadInt64(&downloadedBytes), Total: it.Size})
 			}
 		}
 	}()
