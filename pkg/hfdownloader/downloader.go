@@ -601,6 +601,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 
 // downloadMultipart downloads a file using multiple parallel range requests and
 // returns the SHA-256 hash computed during assembly.
+// Concurrency is capped to cfg.Concurrency to avoid spawning thousands of
+// goroutines (and exhausting the HTTP transport) when downloading large files
+// or multiple repositories simultaneously.
 func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent), partSize int64) (string, error) {
 	// HEAD to resolve size
 	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
@@ -633,7 +636,17 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		tmpParts[i] = fmt.Sprintf("%s.part-%02d", dst, i)
 	}
 
-	// Download parts in parallel
+	// Download parts in parallel, capped to cfg.Concurrency goroutines.
+	concurrency := cfg.Concurrency
+	if concurrency <= 0 {
+		concurrency = 8
+	}
+	if concurrency > numParts {
+		concurrency = numParts
+	}
+	type semToken struct{}
+	sem := make(chan semToken, concurrency)
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, numParts)
 
@@ -645,9 +658,18 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			end = it.Size - 1
 		}
 
+		// Acquire a concurrency slot before launching the goroutine.
+		// If the context is cancelled stop scheduling new parts immediately.
+		select {
+		case sem <- semToken{}:
+		case <-ctx.Done():
+			goto partsLaunched
+		}
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() { <-sem }()
 			tmp := tmpParts[i]
 			expected := end - start + 1
 
@@ -743,6 +765,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			}
 		}()
 	}
+partsLaunched:
 
 	// Emit periodic progress while parts download.
 	tickerDone := make(chan struct{})
