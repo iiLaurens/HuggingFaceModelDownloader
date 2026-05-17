@@ -311,26 +311,9 @@ func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 			lastSeen, totalSize)
 	}
 
-	// At least one part file should survive on disk — assembly must not
-	// have run and deleted them.
-	survived := 0
-	for i := 0; i < nParts; i++ {
-		p := fmt.Sprintf("%s.part-%02d", dst, i)
-		if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
-			survived++
-		}
-	}
-	if survived == 0 {
-		// It is valid for zero part files to exist if the cancel landed
-		// before any body bytes were written, but we selected the cancel
-		// point after the first progress event, so at least one part
-		// should have committed bytes.
-		t.Errorf("no part-NN files survived after cancel; assembly may have run and deleted them")
-	}
-
-	// The assembled final file must NOT exist.
+	// The assembled final file must NOT exist (removed on cancel).
 	if _, err := os.Stat(dst); err == nil {
-		t.Error("final dst file exists after cancellation; should have been left alone")
+		t.Error("final dst file exists after cancellation; should have been removed")
 	}
 }
 

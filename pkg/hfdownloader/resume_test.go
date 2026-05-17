@@ -183,13 +183,11 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_ResumesPartialPart verifies that when a part file has
-// been partially written (not fully complete, not empty), downloadMultipart
-// resumes from the existing offset via a Range request rather than truncating
-// and restarting. Also verifies that fully-complete parts are skipped.
-func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
-	tmpDir := t.TempDir()
-	// Build a deterministic payload where each byte is its index mod 251.
+// TestDownloadMultipart_NoPartFiles verifies that the multipart downloader
+// never creates intermediate per-part files on disk. Parts are held in memory
+// and written directly to the single staging file, so the only disk artifact
+// during a download is "<dst>.part", which is renamed to dst on success.
+func TestDownloadMultipart_NoPartFiles(t *testing.T) {
 	const totalSize = 10000
 	full := make([]byte, totalSize)
 	for i := range full {
@@ -198,38 +196,21 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	const nParts = 4
 	const partSize = totalSize / nParts // 2500
 
-	dst := filepath.Join(tmpDir, "blobs", "tmp-multi")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Part 0: fully complete
-	if err := os.WriteFile(dst+".part-00", full[0:partSize], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Part 1: half done (correct prefix)
-	const part1Have = partSize / 2
-	if err := os.WriteFile(dst+".part-01", full[partSize:partSize+part1Have], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Parts 2, 3: missing
-
-	var (
-		mu        sync.Mutex
-		rangeHdrs []string
-	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
 			w.Header().Set("Accept-Ranges", "bytes")
 			return
 		}
-		mu.Lock()
-		rangeHdrs = append(rangeHdrs, r.Header.Get("Range"))
-		mu.Unlock()
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 	}))
 	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-multi")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	it := PlanItem{
 		RelativePath: "test.bin",
@@ -244,33 +225,7 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 
-	mu.Lock()
-	gotRanges := append([]string(nil), rangeHdrs...)
-	mu.Unlock()
-
-	// Part 0 should never have been requested (fully complete on disk).
-	part0Range := fmt.Sprintf("bytes=0-%d", partSize-1)
-	for _, rh := range gotRanges {
-		if rh == part0Range {
-			t.Errorf("part 0 was re-downloaded (range %q); ranges=%v", part0Range, gotRanges)
-			break
-		}
-	}
-
-	// Part 1 should have been resumed from part1Have bytes in, not from the part start.
-	wantPart1 := fmt.Sprintf("bytes=%d-%d", partSize+part1Have, 2*partSize-1)
-	found := false
-	for _, rh := range gotRanges {
-		if rh == wantPart1 {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("part 1 not resumed from offset: wanted %q in ranges=%v", wantPart1, gotRanges)
-	}
-
-	// Final file should match.
+	// Final file must be correct.
 	got, err := os.ReadFile(dst)
 	if err != nil {
 		t.Fatalf("read final: %v", err)
@@ -278,11 +233,18 @@ func TestDownloadMultipart_ResumesPartialPart(t *testing.T) {
 	if !bytes.Equal(got, full) {
 		t.Errorf("final content mismatch: len got=%d want=%d", len(got), len(full))
 	}
-	// Part files should have been cleaned up after assembly.
-	for i := 0; i < nParts; i++ {
-		p := fmt.Sprintf("%s.part-%02d", dst, i)
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("part file %s should be removed, stat err: %v", p, err)
+
+	// Staging file must be renamed away (no .part left behind).
+	if _, err := os.Stat(dst + ".part"); !os.IsNotExist(err) {
+		t.Errorf("staging file %s.part should not exist after success", dst)
+	}
+
+	// No per-part files must have been created.
+	entries, _ := os.ReadDir(filepath.Dir(dst))
+	for _, e := range entries {
+		name := e.Name()
+		if len(name) > 8 && name[len(name)-8:len(name)-2] == ".part-" {
+			t.Errorf("unexpected per-part file found: %s", name)
 		}
 	}
 }
