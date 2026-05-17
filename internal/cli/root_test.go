@@ -89,7 +89,7 @@ func TestBuildCommandString(t *testing.T) {
 	// Helper to create default settings
 	defaultSettings := func() hfdownloader.Settings {
 		return hfdownloader.Settings{
-			Concurrency:        8,
+			Concurrency:        32,
 			MaxActiveDownloads: 3,
 			Verify:             "size",
 		}
