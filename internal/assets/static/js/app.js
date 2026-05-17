@@ -80,11 +80,19 @@
       };
 
       state.ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          handleWSMessage(msg);
-        } catch (e) {
-          console.error('WS parse error:', e);
+        // writePump may batch multiple newline-delimited JSON objects into a
+        // single WebSocket frame. Parse each line independently so that none
+        // of the updates are silently dropped.
+        const lines = event.data.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const msg = JSON.parse(trimmed);
+            handleWSMessage(msg);
+          } catch (e) {
+            console.error('WS parse error:', e);
+          }
         }
       };
 
