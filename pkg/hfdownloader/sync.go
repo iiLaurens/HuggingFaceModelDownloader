@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // SyncOptions configures the sync operation.
@@ -202,7 +203,126 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 		return created, updated, fmt.Errorf("walk snapshot: %w", err)
 	}
 
+	// Reconcile the hfd.yaml manifest so it accurately reflects the files
+	// that are actually present on disk.  This corrects stale manifests
+	// written by older versions of the software or by external tools.
+	if reconcileErr := reconcileManifest(repoDir, commit); reconcileErr != nil {
+		// Non-fatal: log the error but don't fail the whole sync.
+		_ = reconcileErr
+	}
+
 	return created, updated, nil
+}
+
+// reconcileManifest rebuilds hfd.yaml so it accurately reflects the files
+// that are actually present in the snapshot and backed by existing blobs.
+// If a manifest already exists its repository metadata (branch, commit,
+// command, timing) is preserved; only the file list and totals are updated.
+// If no manifest exists a new one is created with the information available
+// from disk.  The function is best-effort: errors are silently ignored so a
+// manifest problem never aborts a rebuild/sync.
+func reconcileManifest(repoDir *RepoDir, commit string) error {
+	snapshotDir := repoDir.SnapshotDir(commit)
+	if _, err := os.Stat(snapshotDir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	// Walk the snapshot and collect files whose blobs actually exist.
+	var files []ManifestFile
+	walkErr := filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		target, readErr := os.Readlink(path)
+		if readErr != nil {
+			return nil
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		blobPath := filepath.Clean(target)
+		blobInfo, statErr := os.Stat(blobPath)
+		if statErr != nil {
+			// Blob doesn't exist on disk — skip this file.
+			return nil
+		}
+		relPath, relErr := filepath.Rel(snapshotDir, path)
+		if relErr != nil {
+			return nil
+		}
+		files = append(files, ManifestFile{
+			Name: relPath,
+			Blob: "blobs/" + filepath.Base(blobPath),
+			Size: blobInfo.Size(),
+		})
+		return nil
+	})
+	if walkErr != nil {
+		return walkErr
+	}
+
+	// Read the existing manifest, if any.
+	friendlyPath := repoDir.FriendlyPath()
+	manifestPath := filepath.Join(friendlyPath, ManifestFilename)
+	existing, _ := ReadManifest(manifestPath)
+
+	// Build the updated manifest.
+	repoType := "model"
+	if repoDir.Type() == RepoTypeDataset {
+		repoType = "dataset"
+	}
+
+	// Try to find the branch name from refs.
+	branch := "main"
+	for _, ref := range []string{"main", "master"} {
+		if c, _ := repoDir.ReadRef(ref); c != "" {
+			branch = ref
+			break
+		}
+	}
+
+	now := time.Now().UTC()
+	manifest := &DownloadManifest{
+		Version:     "1.0",
+		Type:        repoType,
+		Repo:        repoDir.RepoID(),
+		Branch:      branch,
+		Commit:      commit,
+		RepoPath:    "hub/" + RepoTypeName(repoDir.Type() == RepoTypeDataset) + "--" + strings.ReplaceAll(repoDir.RepoID(), "/", "--"),
+		StartedAt:   now,
+		CompletedAt: now,
+		Files:       files,
+	}
+	// Compute totals from actual files.
+	for _, f := range files {
+		manifest.TotalFiles++
+		manifest.TotalSize += f.Size
+	}
+
+	// Preserve metadata from the existing manifest where possible.
+	if existing != nil {
+		if existing.Branch != "" {
+			manifest.Branch = existing.Branch
+		}
+		if existing.Commit != "" {
+			manifest.Commit = existing.Commit
+		}
+		if existing.Command != "" {
+			manifest.Command = existing.Command
+		}
+		if !existing.StartedAt.IsZero() {
+			manifest.StartedAt = existing.StartedAt
+		}
+		if !existing.CompletedAt.IsZero() {
+			manifest.CompletedAt = existing.CompletedAt
+		}
+	}
+
+	_, writeErr := manifest.Write(friendlyPath)
+	return writeErr
 }
 
 // cleanOrphanedSymlinks removes symlinks in friendly view that point to non-existent files.

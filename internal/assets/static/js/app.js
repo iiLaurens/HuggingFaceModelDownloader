@@ -145,7 +145,7 @@
 
   function updateJobsBadge() {
     const activeCount = Array.from(state.jobs.values())
-      .filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'paused').length;
+      .filter(j => j.status === 'running' || j.status === 'queued').length;
 
     const badge = $('#jobsBadge');
     if (badge) {
@@ -858,15 +858,14 @@
   // lost pointerdown/pointerup continuity mid-click. Now we keep stable
   // elements keyed by job ID and only mutate the fields that actually
   // changed. Buttons are only re-rendered when the status category
-  // transitions (e.g. running→paused), not on every progress tick.
+  // transitions (e.g. running→cancelled), not on every progress tick.
   const jobCardCache = new Map();
 
   // statusCategory groups statuses that share the same action buttons so
   // we only swap the buttons when the category changes. Running / queued
-  // both show Cancel; paused has Resume+Cancel; terminal states show Dismiss.
+  // both show Cancel; terminal states show Dismiss.
   function statusCategory(status) {
     if (status === 'running' || status === 'queued') return 'active';
-    if (status === 'paused') return 'paused';
     if (status === 'completed' || status === 'failed' || status === 'cancelled') return 'done';
     return status || 'unknown';
   }
@@ -876,13 +875,6 @@
     const status = job.status || 'queued';
     if (status === 'running') {
       return `
-          <button class="btn btn-sm btn-warning" onclick="pauseJob('${id}')">Pause</button>
-          <button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>
-      `;
-    }
-    if (status === 'paused') {
-      return `
-          <button class="btn btn-sm btn-primary" onclick="resumeJob('${id}')">Resume</button>
           <button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>
       `;
     }
@@ -1062,41 +1054,7 @@
     }
   };
 
-  // Pause a running job
-  window.pauseJob = async function(jobId) {
-    try {
-      await api('POST', `/jobs/${jobId}/pause`);
-      showToast('Download paused', 'success');
-      const job = state.jobs.get(jobId);
-      if (job) {
-        job.status = 'paused';
-        state.jobs.set(jobId, job);
-        renderJobs();
-        updateJobsBadge();
-      }
-    } catch (e) {
-      showToast(`Failed to pause: ${e.message}`, 'error');
-    }
-  };
-
-  // Resume a paused job
-  window.resumeJob = async function(jobId) {
-    try {
-      await api('POST', `/jobs/${jobId}/resume`);
-      showToast('Download resumed', 'success');
-      const job = state.jobs.get(jobId);
-      if (job) {
-        job.status = 'queued';
-        state.jobs.set(jobId, job);
-        renderJobs();
-        updateJobsBadge();
-      }
-    } catch (e) {
-      showToast(`Failed to resume: ${e.message}`, 'error');
-    }
-  };
-
-  // Dismiss (permanently remove) a completed/failed/cancelled/paused job.
+  // Dismiss (permanently remove) a completed/failed/cancelled job.
   // We call the server so the dismissal survives a page refresh (github #68).
   window.dismissJob = async function(jobId) {
     try {

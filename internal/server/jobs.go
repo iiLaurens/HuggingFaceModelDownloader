@@ -17,12 +17,11 @@ import (
 type JobStatus string
 
 const (
-	JobStatusQueued     JobStatus = "queued"
-	JobStatusRunning    JobStatus = "running"
-	JobStatusPaused     JobStatus = "paused"
-	JobStatusCompleted  JobStatus = "completed"
-	JobStatusFailed     JobStatus = "failed"
-	JobStatusCancelled  JobStatus = "cancelled"
+	JobStatusQueued    JobStatus = "queued"
+	JobStatusRunning   JobStatus = "running"
+	JobStatusCompleted JobStatus = "completed"
+	JobStatusFailed    JobStatus = "failed"
+	JobStatusCancelled JobStatus = "cancelled"
 )
 
 // Job represents a download job.
@@ -84,7 +83,7 @@ type JobManager struct {
 // wsBroadcastMinGap is the minimum interval between consecutive WebSocket
 // broadcasts for the same job. Progress events arriving inside this window
 // are coalesced — only the latest job state is flushed when the window
-// elapses. Terminal status changes (completed, failed, cancelled, paused)
+// elapses. Terminal status changes (completed, failed, cancelled)
 // bypass this gate and are sent immediately. See github issue #62.
 const wsBroadcastMinGap = 250 * time.Millisecond
 
@@ -252,14 +251,14 @@ func (m *JobManager) ListJobs() []*Job {
 	return jobs
 }
 
-// HasActiveJobs returns true if any jobs are currently running, queued, or paused.
+// HasActiveJobs returns true if any jobs are currently running or queued.
 func (m *JobManager) HasActiveJobs() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	for _, job := range m.jobs {
 		switch job.Status {
-		case JobStatusRunning, JobStatusQueued, JobStatusPaused:
+		case JobStatusRunning, JobStatusQueued:
 			return true
 		}
 	}
@@ -275,7 +274,7 @@ func (m *JobManager) CancelJob(id string) bool {
 		return false
 	}
 
-	if job.Status != JobStatusQueued && job.Status != JobStatusRunning && job.Status != JobStatusPaused {
+	if job.Status != JobStatusQueued && job.Status != JobStatusRunning {
 		m.mu.Unlock()
 		return false
 	}
@@ -290,64 +289,6 @@ func (m *JobManager) CancelJob(id string) bool {
 	m.mu.Unlock()
 
 	m.notifyListeners(snapshot)
-	return true
-}
-
-// PauseJob pauses a running job.
-func (m *JobManager) PauseJob(id string) bool {
-	m.mu.Lock()
-	job, ok := m.jobs[id]
-	if !ok {
-		m.mu.Unlock()
-		return false
-	}
-
-	if job.Status != JobStatusRunning {
-		m.mu.Unlock()
-		return false
-	}
-
-	if job.cancel != nil {
-		job.cancel()
-	}
-	job.Status = JobStatusPaused
-	snapshot := m.cloneJobLocked(job)
-	m.mu.Unlock()
-
-	m.notifyListeners(snapshot)
-	return true
-}
-
-// ResumeJob resumes a paused job.
-func (m *JobManager) ResumeJob(id string) bool {
-	m.mu.Lock()
-	job, ok := m.jobs[id]
-	if !ok {
-		m.mu.Unlock()
-		return false
-	}
-
-	if job.Status != JobStatusPaused {
-		m.mu.Unlock()
-		return false
-	}
-
-	job.Status = JobStatusQueued
-	// Reset progress - the downloader will re-scan and report all files.
-	// Already-downloaded files will be skipped during actual download but
-	// reported in plan.
-	job.Progress = JobProgress{}
-	job.Files = nil
-	snapshot := m.cloneJobLocked(job)
-	m.mu.Unlock()
-
-	// Notify listeners of status change
-	m.notifyListeners(snapshot)
-
-	// Restart the job - already downloaded files will be skipped by the downloader
-	m.runWG.Add(1)
-	go m.runJob(job)
-
 	return true
 }
 
@@ -404,7 +345,7 @@ const (
 )
 
 // DismissJob removes a job from the manager if and only if it is in a
-// terminal state (completed, failed, cancelled, paused). Dismissal is the
+// terminal state (completed, failed, cancelled). Dismissal is the
 // user's way of hiding a finished job from the UI permanently, and the
 // guarantee that matters for github issue #68 is that the job does not
 // come back on the next page refresh — so the underlying storage drops it.
@@ -458,7 +399,7 @@ func (m *JobManager) Unsubscribe(ch chan *Job) {
 // listeners and the WebSocket broadcast path. The caller MUST pass in a
 // snapshot (produced by cloneJobLocked while holding m.mu) — this function
 // does not take m.mu itself, so it is safe to call from sites that already
-// hold m.mu.Lock() (like CancelJob / PauseJob with a deferred unlock).
+// hold m.mu.Lock() (like CancelJob with a deferred unlock).
 func (m *JobManager) notifyListeners(snapshot *Job) {
 	// Notify channel listeners (tests and other internal subscribers see
 	// every raw update; only the WebSocket path is throttled).
@@ -594,10 +535,8 @@ func (m *JobManager) runJob(job *Job) {
 
 	// Update final status
 	m.mu.Lock()
-	// Don't update status if:
-	// 1. Job was paused (user intentionally stopped it)
-	// 2. We're a stale goroutine (a newer runJob has started)
-	if job.Status == JobStatusPaused || job.generation != myGeneration {
+	// Don't update status if we're a stale goroutine (a newer runJob has started).
+	if job.generation != myGeneration {
 		m.mu.Unlock()
 		return
 	}

@@ -13,8 +13,8 @@ import (
 // rate (github issue #62). For each job ID we enforce a minimum gap between
 // sends; events arriving inside the gap are collapsed — only the latest queued
 // state is flushed when the gap elapses. Terminal status changes (completed,
-// failed, cancelled, paused) bypass the gap and are sent immediately so the
-// UI sees the final state and its pause/resume buttons without delay.
+// failed, cancelled) bypass the gap and are sent immediately so the
+// UI sees the final state without delay.
 type jobCoalescer struct {
 	mu       sync.Mutex
 	lastSent map[string]time.Time
@@ -127,7 +127,7 @@ func (c *jobCoalescer) stop() {
 // cares about seeing right away (so it shouldn't be delayed by the throttle).
 func isTerminalJobStatus(s JobStatus) bool {
 	switch s {
-	case JobStatusCompleted, JobStatusFailed, JobStatusCancelled, JobStatusPaused:
+	case JobStatusCompleted, JobStatusFailed, JobStatusCancelled:
 		return true
 	default:
 		return false
