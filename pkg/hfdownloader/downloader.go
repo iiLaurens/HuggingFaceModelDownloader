@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -650,23 +651,74 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		windowSize = numParts
 	}
 
-	// Open the staging file, truncating any leftover from a previous run.
+	// Open the staging file.
+	//
+	// Resume support: check for a tracker sidecar ({dst}.part.ranges) that
+	// records which parts were already written in a previous interrupted run.
+	// If one is found and compatible, we open the .part file without truncation
+	// and skip re-downloading the already-written parts.
 	tmp := dst + ".part"
-	out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return "", err
+	trackerPath := dst + ".part.ranges"
+
+	tracker := loadMultipartTracker(trackerPath, it.Size, partSize)
+
+	// Build the done-parts set and compute bytes already on disk.
+	doneSet := make(map[int]bool)
+	if tracker != nil {
+		for _, p := range tracker.DoneParts {
+			if p >= 0 && p < numParts {
+				doneSet[p] = true
+			}
+		}
 	}
-	// Pre-allocate the full file size so WriteAt calls land on already-reserved
-	// blocks rather than creating sparse holes or extending on every write.
-	if err := out.Truncate(it.Size); err != nil {
-		out.Close()
-		os.Remove(tmp)
+	var resumedBytes int64
+	for p := range doneSet {
+		start := int64(p) * partSize
+		end := start + partSize
+		if end > it.Size {
+			end = it.Size
+		}
+		resumedBytes += end - start
+	}
+
+	// Validate that the .part file is present and correctly sized before
+	// trusting the tracker. If it is gone or the wrong size, discard the
+	// stale tracker and fall back to a fresh start.
+	isResume := len(doneSet) > 0
+	if isResume {
+		fi, statErr := os.Stat(tmp)
+		if statErr != nil || fi.Size() != it.Size {
+			isResume = false
+			doneSet = make(map[int]bool)
+			resumedBytes = 0
+			os.Remove(trackerPath)
+		}
+	}
+
+	var out *os.File
+	var err error
+	if isResume {
+		// Preserve existing partial data; no truncation.
+		out, err = os.OpenFile(tmp, os.O_RDWR, 0o644)
+	} else {
+		// Fresh start: truncate any leftover and pre-allocate.
+		out, err = os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+		if err == nil {
+			if err = out.Truncate(it.Size); err != nil {
+				out.Close()
+				os.Remove(tmp)
+				return "", err
+			}
+		}
+	}
+	if err != nil {
 		return "", err
 	}
 
 	type partResult struct {
-		data []byte
-		err  error
+		data    []byte
+		err     error
+		skipped bool // true when the part was already on disk from a previous run
 	}
 
 	// One buffered channel per part so workers never block after finishing.
@@ -681,24 +733,49 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	sem := make(chan struct{}, windowSize)
 
 	// downloadedBytes is sampled by the progress ticker without a lock.
-	var downloadedBytes int64
+	// Seed it with resumedBytes so the progress bar starts at the right position.
+	downloadedBytes := resumedBytes
 
 	// Internal context so the first part error cancels all remaining workers.
 	partCtx, partCancel := context.WithCancel(ctx)
 	defer partCancel()
 
+	// Emit initial progress so the UI shows the correct position immediately
+	// when resuming from a partially-written .part file.
+	if resumedBytes > 0 {
+		emit(ProgressEvent{
+			Event:      "file_progress",
+			Path:       it.RelativePath,
+			Downloaded: resumedBytes,
+			Total:      it.Size,
+		})
+	}
+
 	// Dispatcher: fills the semaphore window sequentially, launches one
-	// goroutine per part.  On cancellation it fills remaining channels with
-	// synthetic errors so the writer can drain cleanly without blocking.
+	// goroutine per part.  Parts that are already recorded in doneSet are
+	// injected as pre-skipped results without touching the semaphore.
+	// On cancellation it fills remaining channels with synthetic errors so
+	// the writer can drain cleanly without blocking.
 	dispatchDone := make(chan struct{})
 	go func() {
 		defer close(dispatchDone)
 		for i := 0; i < numParts; i++ {
+			if doneSet[i] {
+				// This part is already on disk. Inject a pre-skipped marker
+				// without acquiring a semaphore slot — no in-memory data needed.
+				results[i] <- partResult{skipped: true}
+				continue
+			}
 			select {
 			case sem <- struct{}{}:
 			case <-partCtx.Done():
+				// Fill remaining unfilled channels so the writer can drain.
 				for j := i; j < numParts; j++ {
-					results[j] <- partResult{err: partCtx.Err()}
+					if doneSet[j] {
+						results[j] <- partResult{skipped: true}
+					} else {
+						results[j] <- partResult{err: partCtx.Err()}
+					}
 				}
 				return
 			}
@@ -743,10 +820,43 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// Writer: processes parts strictly in ascending order so that SHA-256 is
 	// fed in the correct sequence and WriteAt places each chunk at the right
 	// file offset.
+	//
+	// currentTracker accumulates the indices of parts written in this run so
+	// that a mid-download pause/cancel can be resumed later.
 	h := sha256.New()
 	var firstErr error
+	currentTracker := &multipartTracker{
+		TotalSize: it.Size,
+		PartSize:  partSize,
+		DoneParts: make([]int, 0, numParts),
+	}
+	// Seed with parts that were already done before this run.
+	for p := range doneSet {
+		currentTracker.DoneParts = append(currentTracker.DoneParts, p)
+	}
 	for i := 0; i < numParts; i++ {
 		result := <-results[i]
+
+		if result.skipped {
+			// Part was already on disk from a previous run. Read it back so
+			// SHA-256 is computed in ascending order without re-downloading.
+			if firstErr == nil {
+				offset := int64(i) * partSize
+				size := partSize
+				if offset+size > it.Size {
+					size = it.Size - offset
+				}
+				buf := make([]byte, size)
+				if _, rerr := out.ReadAt(buf, offset); rerr != nil {
+					firstErr = fmt.Errorf("read resumed part %d: %w", i, rerr)
+					partCancel()
+				} else {
+					h.Write(buf)
+				}
+			}
+			continue
+		}
+
 		// Release the window slot so the dispatcher can launch the next part.
 		<-sem
 
@@ -761,6 +871,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 					partCancel()
 				} else {
 					h.Write(result.data) // in-order: hash stays correct
+					// Record this part as done and persist the tracker so a
+					// subsequent pause/cancel can resume from here.
+					currentTracker.DoneParts = append(currentTracker.DoneParts, i)
+					saveMultipartTracker(trackerPath, currentTracker)
 				}
 			}
 		}
@@ -773,11 +887,11 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	<-dispatchDone
 
 	if firstErr != nil {
-		os.Remove(tmp)
+		// Keep .part and tracker intact so the download can be resumed later.
 		return "", firstErr
 	}
 	if ctx.Err() != nil {
-		os.Remove(tmp)
+		// Paused or cancelled: keep .part and tracker for resume.
 		return "", ctx.Err()
 	}
 
@@ -789,6 +903,9 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		Total:      it.Size,
 	})
 
+	// Remove the tracker sidecar before renaming the staging file so we
+	// never leave an orphaned tracker pointing at a non-existent .part file.
+	os.Remove(trackerPath)
 	if err := os.Rename(tmp, dst); err != nil {
 		os.Remove(tmp)
 		return "", err
@@ -857,4 +974,49 @@ func downloadPartInMemory(ctx context.Context, httpc *http.Client, token, rawURL
 		}
 	}
 	return nil, lastErr
+}
+
+// --- Multipart resume tracker ---
+
+// multipartTracker records which parts of a multipart download have been
+// successfully written to the .part staging file. It is stored as a small
+// JSON sidecar alongside the .part file so that interrupted downloads can
+// resume without re-downloading already-written byte ranges.
+type multipartTracker struct {
+	TotalSize int64 `json:"totalSize"`
+	PartSize  int64 `json:"partSize"`
+	DoneParts []int `json:"doneParts"`
+}
+
+// loadMultipartTracker reads the tracker sidecar and validates it against the
+// current download parameters. Returns nil when the file is absent,
+// unreadable, or does not match totalSize / partSize.
+func loadMultipartTracker(path string, totalSize, partSize int64) *multipartTracker {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var t multipartTracker
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil
+	}
+	if t.TotalSize != totalSize || t.PartSize != partSize {
+		return nil
+	}
+	return &t
+}
+
+// saveMultipartTracker atomically writes the tracker to path using a
+// write-then-rename strategy. Failures are silently ignored — the tracker
+// is best-effort; a missing or corrupt file simply causes a fresh start.
+func saveMultipartTracker(path string, t *multipartTracker) {
+	data, err := json.Marshal(t)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }

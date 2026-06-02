@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -239,6 +240,11 @@ func TestDownloadMultipart_NoPartFiles(t *testing.T) {
 		t.Errorf("staging file %s.part should not exist after success", dst)
 	}
 
+	// Tracker sidecar must also be cleaned up on success.
+	if _, err := os.Stat(dst + ".part.ranges"); !os.IsNotExist(err) {
+		t.Errorf("tracker file %s.part.ranges should not exist after success", dst)
+	}
+
 	// No per-part files must have been created.
 	entries, _ := os.ReadDir(filepath.Dir(dst))
 	for _, e := range entries {
@@ -246,5 +252,111 @@ func TestDownloadMultipart_NoPartFiles(t *testing.T) {
 		if len(name) > 8 && name[len(name)-8:len(name)-2] == ".part-" {
 			t.Errorf("unexpected per-part file found: %s", name)
 		}
+	}
+}
+
+// TestDownloadMultipart_ResumesFromTracker verifies that a multipart download
+// that was interrupted mid-way can be resumed. The test pre-populates the
+// staging (.part) file and a tracker sidecar (.part.ranges) with the first half
+// of parts already done, then calls downloadMultipart again. Only the remaining
+// parts should be fetched from the HTTP server; the already-done parts must not
+// produce any extra HTTP requests.
+func TestDownloadMultipart_ResumesFromTracker(t *testing.T) {
+	const totalSize = 10000
+	full := make([]byte, totalSize)
+	for i := range full {
+		full[i] = byte(i % 251)
+	}
+	const nParts = 4
+	const partSize = totalSize / nParts // 2500
+
+	// Count how many range-requests the server actually receives.
+	var requestCount int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		atomic.AddInt64(&requestCount, 1)
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "blobs", "tmp-multi-resume")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// --- Simulate a previous run that wrote parts 0 and 1 ---
+	// Create the .part file (pre-allocated to full size).
+	partFile := dst + ".part"
+	pf, err := os.OpenFile(partFile, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pf.Truncate(totalSize); err != nil {
+		pf.Close()
+		t.Fatal(err)
+	}
+	// Write parts 0 and 1 directly.
+	for _, p := range []int{0, 1} {
+		offset := int64(p) * partSize
+		chunk := full[offset : offset+partSize]
+		if _, err := pf.WriteAt(chunk, offset); err != nil {
+			pf.Close()
+			t.Fatal(err)
+		}
+	}
+	pf.Close()
+
+	// Write the tracker sidecar marking parts 0 and 1 as done.
+	tracker := &multipartTracker{
+		TotalSize: totalSize,
+		PartSize:  partSize,
+		DoneParts: []int{0, 1},
+	}
+	saveMultipartTracker(dst+".part.ranges", tracker)
+	if _, err := os.Stat(dst + ".part.ranges"); os.IsNotExist(err) {
+		t.Fatal("failed to write tracker sidecar")
+	}
+	// Reset the request counter (HEAD is fired during loadMultipartTracker, etc.)
+	atomic.StoreInt64(&requestCount, 0)
+
+	// --- Execute resume ---
+	it := PlanItem{
+		RelativePath: "test-resume.bin",
+		URL:          srv.URL + "/test-resume.bin",
+		Size:         int64(len(full)),
+		AcceptRanges: true,
+	}
+	cfg := Settings{Concurrency: nParts, Retries: 0}
+
+	_, err = downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}, partSize)
+	if err != nil {
+		t.Fatalf("downloadMultipart resume: %v", err)
+	}
+
+	// Final file must match full content.
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read final: %v", err)
+	}
+	if !bytes.Equal(got, full) {
+		t.Errorf("final content mismatch: len got=%d want=%d", len(got), len(full))
+	}
+
+	// Only the remaining 2 parts should have been fetched (parts 2 and 3).
+	if n := atomic.LoadInt64(&requestCount); n != 2 {
+		t.Errorf("expected 2 HTTP range requests, got %d", n)
+	}
+
+	// Staging file and tracker must be cleaned up after success.
+	if _, err := os.Stat(partFile); !os.IsNotExist(err) {
+		t.Errorf("%s.part should not exist after success", dst)
+	}
+	if _, err := os.Stat(dst + ".part.ranges"); !os.IsNotExist(err) {
+		t.Errorf("%s.part.ranges should not exist after success", dst)
 	}
 }

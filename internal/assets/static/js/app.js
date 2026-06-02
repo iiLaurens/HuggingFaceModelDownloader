@@ -862,10 +862,15 @@
   const jobCardCache = new Map();
 
   // statusCategory groups statuses that share the same action buttons so
-  // we only swap the buttons when the category changes. Running / queued
-  // both show Cancel; paused has Resume+Cancel; terminal states show Dismiss.
+  // we only swap the buttons when the category changes. Running shows
+  // Pause+Cancel; queued shows Cancel only; paused has Resume+Cancel;
+  // terminal states show Dismiss.
+  // NOTE: running and queued must be separate categories so that when a
+  // resumed job transitions queued→running the buttons are re-rendered and
+  // the Pause button reappears.
   function statusCategory(status) {
-    if (status === 'running' || status === 'queued') return 'active';
+    if (status === 'running') return 'running';
+    if (status === 'queued') return 'queued';
     if (status === 'paused') return 'paused';
     if (status === 'completed' || status === 'failed' || status === 'cancelled') return 'done';
     return status || 'unknown';
