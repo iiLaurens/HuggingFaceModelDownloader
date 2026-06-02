@@ -599,189 +599,123 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	return "", lastErr
 }
 
-// downloadMultipart downloads a file using multiple parallel range requests and
-// returns the SHA-256 hash computed during assembly.
-// Concurrency is capped to cfg.Concurrency to avoid spawning thousands of
-// goroutines (and exhausting the HTTP transport) when downloading large files
-// or multiple repositories simultaneously.
+// downloadMultipart downloads a file using multiple parallel range requests.
+// Parts are kept entirely in memory — no intermediate part files are written
+// to disk. Each part is written directly to the final file at the correct
+// offset via WriteAt, and SHA-256 is computed in ascending part order so the
+// hash is correct without a second read.
+//
+// Memory is bounded by a sliding window: at most windowSize parts (each up to
+// partSize bytes) are held in memory concurrently.  windowSize is derived from
+// a per-file cap of ~512 MiB so peak memory scales with partSize rather than
+// concurrency.
+//
+// Incomplete downloads are staged in a "<dst>.part" file and renamed to dst
+// only on success, making interrupted downloads safe to prune.
 func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, emit func(ProgressEvent), partSize int64) (string, error) {
-	// HEAD to resolve size
-	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
-	addAuth(req, token)
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return "", err
-	}
-	resp.Body.Close()
-
+	// Resolve the file size via HEAD when the plan did not provide it.
 	if it.Size == 0 {
+		req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
+		addAuth(req, token)
+		resp, err := httpc.Do(req)
+		if err != nil {
+			return "", err
+		}
+		resp.Body.Close()
 		if clen := resp.Header.Get("Content-Length"); clen != "" {
-			var n int64
-			fmt.Sscan(clen, &n)
-			it.Size = n
+			fmt.Sscan(clen, &it.Size)
 		}
 	}
 	if it.Size == 0 {
+		// Size still unknown — fall back to a single-request download.
 		return downloadSingle(ctx, httpc, token, job, cfg, it, dst, emit)
 	}
 
-	// Plan parts using configurable partSize
 	numParts := int((it.Size + partSize - 1) / partSize)
-	if numParts < 1 {
-		numParts = 1
-	}
 
-	tmpParts := make([]string, numParts)
-	for i := 0; i < numParts; i++ {
-		tmpParts[i] = fmt.Sprintf("%s.part-%02d", dst, i)
-	}
-
-	// Seed the progress counter with bytes already on disk from any previous
-	// interrupted run so the ticker reflects resumed progress immediately.
-	var downloadedBytes int64
-	for _, p := range tmpParts {
-		if fi, err := os.Stat(p); err == nil {
-			atomic.AddInt64(&downloadedBytes, fi.Size())
-		}
-	}
-
-	// Download parts in parallel, capped to cfg.Concurrency goroutines.
+	// Derive the memory window: cap per-file in-flight memory at ~512 MiB.
 	concurrency := cfg.Concurrency
 	if concurrency <= 0 {
 		concurrency = 32
 	}
-	if concurrency > numParts {
-		concurrency = numParts
+	const maxMemBytes = 512 << 20
+	windowSize := int(int64(maxMemBytes) / partSize)
+	if windowSize < 1 {
+		windowSize = 1
 	}
-	type semToken struct{}
-	sem := make(chan semToken, concurrency)
+	if windowSize > concurrency {
+		windowSize = concurrency
+	}
+	if windowSize > numParts {
+		windowSize = numParts
+	}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, numParts)
+	// Open the staging file, truncating any leftover from a previous run.
+	tmp := dst + ".part"
+	out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", err
+	}
+	// Pre-allocate the full file size so WriteAt calls land on already-reserved
+	// blocks rather than creating sparse holes or extending on every write.
+	if err := out.Truncate(it.Size); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return "", err
+	}
 
-	for i := 0; i < numParts; i++ {
-		i := i
-		start := int64(i) * partSize
-		end := start + partSize - 1
-		if end >= it.Size {
-			end = it.Size - 1
-		}
+	type partResult struct {
+		data []byte
+		err  error
+	}
 
-		// Acquire a concurrency slot before launching the goroutine.
-		// If the context is cancelled stop scheduling new parts immediately.
-		select {
-		case sem <- semToken{}:
-		case <-ctx.Done():
-			goto partsLaunched
-		}
+	// One buffered channel per part so workers never block after finishing.
+	results := make([]chan partResult, numParts)
+	for i := range results {
+		results[i] = make(chan partResult, 1)
+	}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			tmp := tmpParts[i]
-			expected := end - start + 1
+	// sem enforces the memory window.
+	// Dispatcher acquires a slot before each launch; writer releases a slot
+	// after consuming and discarding the in-memory buffer.
+	sem := make(chan struct{}, windowSize)
 
-			// Open or create the part file without truncating; we may be
-			// resuming from a previous interrupted run.
-			out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE, 0o644)
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-			defer out.Close()
+	// downloadedBytes is sampled by the progress ticker without a lock.
+	var downloadedBytes int64
 
-			fi, err := out.Stat()
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-			pos := fi.Size()
-			// Already fully downloaded.
-			if pos == expected {
-				return
-			}
-			// Oversize (stale/corrupt) — reset. Un-count the stale bytes that
-			// were included in the initial seed so the progress stays accurate.
-			if pos > expected {
-				atomic.AddInt64(&downloadedBytes, -pos)
-				if err := out.Truncate(0); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-				pos = 0
-			}
-			if _, err := out.Seek(pos, io.SeekStart); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
+	// Internal context so the first part error cancels all remaining workers.
+	partCtx, partCancel := context.WithCancel(ctx)
+	defer partCancel()
 
-			retry := newRetry(cfg)
-			var lastErr error
-
-			for attempt := 0; attempt <= cfg.Retries; attempt++ {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-
-				rq, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
-				addAuth(rq, token)
-				rq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+pos, end))
-
-				rs, err := httpc.Do(rq)
-				if err != nil {
-					lastErr = err
-				} else if rs.StatusCode != 206 {
-					lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
-					rs.Body.Close()
-				} else {
-					// Count bytes as they arrive, so the progress ticker reflects
-					// in-flight data rather than only bytes flushed to disk.
-					cr := &countingReader{r: rs.Body, counter: &downloadedBytes}
-					_, cerr := io.Copy(out, cr)
-					rs.Body.Close()
-					if cerr == nil {
-						return
-					}
-					lastErr = cerr
-					// Advance pos by what we actually wrote so the next retry
-					// Range request picks up from the correct offset.
-					if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
-						pos = cur
-					}
-				}
-
-				if attempt < cfg.Retries {
-					emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
-					if d := retry.Next(); !sleepCtx(ctx, d) {
-						return
-					}
-				}
-			}
-
+	// Dispatcher: fills the semaphore window sequentially, launches one
+	// goroutine per part.  On cancellation it fills remaining channels with
+	// synthetic errors so the writer can drain cleanly without blocking.
+	dispatchDone := make(chan struct{})
+	go func() {
+		defer close(dispatchDone)
+		for i := 0; i < numParts; i++ {
 			select {
-			case errCh <- lastErr:
-			default:
+			case sem <- struct{}{}:
+			case <-partCtx.Done():
+				for j := i; j < numParts; j++ {
+					results[j] <- partResult{err: partCtx.Err()}
+				}
+				return
 			}
-		}()
-	}
-partsLaunched:
+			idx := i
+			start := int64(idx) * partSize
+			end := start + partSize - 1
+			if end >= it.Size {
+				end = it.Size - 1
+			}
+			go func() {
+				data, err := downloadPartInMemory(partCtx, httpc, token, it.URL, start, end, cfg, &downloadedBytes, emit, it.RelativePath)
+				results[idx] <- partResult{data: data, err: err}
+			}()
+		}
+	}()
 
-	// Emit periodic progress while parts download.
+	// Progress ticker: samples downloadedBytes at 200 ms intervals.
 	tickerDone := make(chan struct{})
 	var tickerWG sync.WaitGroup
 	tickerWG.Add(1)
@@ -791,69 +725,136 @@ partsLaunched:
 		defer t.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-partCtx.Done():
 				return
 			case <-tickerDone:
 				return
 			case <-t.C:
-				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: atomic.LoadInt64(&downloadedBytes), Total: it.Size})
+				emit(ProgressEvent{
+					Event:      "file_progress",
+					Path:       it.RelativePath,
+					Downloaded: atomic.LoadInt64(&downloadedBytes),
+					Total:      it.Size,
+				})
 			}
 		}
 	}()
 
-	wg.Wait()
+	// Writer: processes parts strictly in ascending order so that SHA-256 is
+	// fed in the correct sequence and WriteAt places each chunk at the right
+	// file offset.
+	h := sha256.New()
+	var firstErr error
+	for i := 0; i < numParts; i++ {
+		result := <-results[i]
+		// Release the window slot so the dispatcher can launch the next part.
+		<-sem
 
-	// Stop the progress ticker before touching part files.
+		if firstErr == nil {
+			if result.err != nil {
+				firstErr = result.err
+				partCancel() // stop all remaining in-flight workers
+			} else {
+				offset := int64(i) * partSize
+				if _, werr := out.WriteAt(result.data, offset); werr != nil {
+					firstErr = werr
+					partCancel()
+				} else {
+					h.Write(result.data) // in-order: hash stays correct
+				}
+			}
+		}
+		result.data = nil // allow GC to reclaim the buffer
+	}
+
 	close(tickerDone)
 	tickerWG.Wait()
+	out.Close()
+	<-dispatchDone
 
-	// If the context was cancelled, return the cancellation error immediately.
+	if firstErr != nil {
+		os.Remove(tmp)
+		return "", firstErr
+	}
 	if ctx.Err() != nil {
+		os.Remove(tmp)
 		return "", ctx.Err()
 	}
 
-	select {
-	case e := <-errCh:
-		return "", e
-	default:
-	}
+	// Final progress event so the caller sees 100 % before file_done arrives.
+	emit(ProgressEvent{
+		Event:      "file_progress",
+		Path:       it.RelativePath,
+		Downloaded: it.Size,
+		Total:      it.Size,
+	})
 
-	// Emit one explicit full-progress reading so the caller's last observed
-	// file_progress value is the full byte count.
-	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
-
-	// Assemble parts, computing SHA-256 during assembly to avoid a second read.
-	out, err := os.Create(dst + ".part")
-	if err != nil {
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
 		return "", err
 	}
-
-	h := sha256.New()
-	mw := io.MultiWriter(out, h)
-
-	for i := 0; i < numParts; i++ {
-		p := tmpParts[i]
-		in, err := os.Open(p)
-		if err != nil {
-			out.Close()
-			return "", err
-		}
-		if _, err := io.Copy(mw, in); err != nil {
-			in.Close()
-			out.Close()
-			return "", err
-		}
-		in.Close()
-	}
-	out.Close()
-
-	if err := os.Rename(dst+".part", dst); err != nil {
-		return "", err
-	}
-
-	for _, p := range tmpParts {
-		_ = os.Remove(p)
-	}
-
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// downloadPartInMemory fetches a single byte range [start, end] into a newly
+// allocated []byte buffer and returns it. The shared counter is incremented
+// atomically as bytes arrive so the progress ticker always reflects in-flight
+// data without holding any lock.
+//
+// Partial reads are accumulated in the pre-allocated buffer across retries so
+// that each retry sends a Range request starting from where the previous
+// attempt stopped. This avoids re-downloading bytes that are already in the
+// buffer and keeps the atomic counter monotonically increasing.
+func downloadPartInMemory(ctx context.Context, httpc *http.Client, token, rawURL string, start, end int64, cfg Settings, counter *int64, emit func(ProgressEvent), path string) ([]byte, error) {
+	expected := end - start + 1
+	buf := make([]byte, expected)
+	var pos int64 // bytes received into buf so far (across all attempts)
+
+	retry := newRetry(cfg)
+	var lastErr error
+
+	for attempt := 0; attempt <= cfg.Retries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		req, _ := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+		addAuth(req, token)
+		// Request only the bytes we still need so retries never re-download
+		// bytes already held in buf.
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+pos, end))
+
+		resp, err := httpc.Do(req)
+		if err != nil {
+			lastErr = err
+		} else if resp.StatusCode != http.StatusPartialContent {
+			lastErr = fmt.Errorf("range not supported (status %s)", resp.Status)
+			resp.Body.Close()
+		} else {
+			// countingReader increments the shared counter on every Read call,
+			// giving the progress ticker sub-part granularity.
+			cr := &countingReader{r: resp.Body, counter: counter}
+			n, rerr := io.ReadFull(cr, buf[pos:])
+			resp.Body.Close()
+			pos += int64(n)
+			if rerr == nil && pos == expected {
+				return buf, nil
+			}
+			if rerr != nil {
+				lastErr = rerr
+			} else {
+				lastErr = fmt.Errorf("short read: got %d bytes, want %d", pos, expected)
+			}
+		}
+
+		if attempt < cfg.Retries {
+			emit(ProgressEvent{Event: "retry", Path: path, Attempt: attempt + 1, Message: lastErr.Error()})
+			if d := retry.Next(); !sleepCtx(ctx, d) {
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return nil, lastErr
 }
