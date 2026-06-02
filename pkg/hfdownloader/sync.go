@@ -215,57 +215,142 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 }
 
 // reconcileManifest rebuilds hfd.yaml so it accurately reflects the files
-// that are actually present in the snapshot and backed by existing blobs.
+// that are actually present on disk.  Two scan phases are performed so that no
+// accessible file is missed:
+//
+//  1. Hub snapshot directory (hub/models--…/snapshots/{commit}/): the
+//     canonical source of truth for the current commit.  Each symlink whose
+//     blob target exists on disk is included.
+//
+//  2. Friendly-view directory (models/{owner}/{repo}/): picks up files that
+//     are visible to the user but were not captured by the snapshot walk — for
+//     example symlinks that still resolve correctly but point to an older
+//     snapshot, or files placed directly by an external tool.
+//
+// Duplicates are detected by blob hash so that the same underlying file is
+// never counted twice even if it appears under different names in the two
+// directory trees (e.g. when AppendFilterSubdir is used).
+//
 // If a manifest already exists its repository metadata (branch, commit,
 // command, timing) is preserved; only the file list and totals are updated.
 // If no manifest exists a new one is created with the information available
 // from disk.  The function is best-effort: errors are silently ignored so a
 // manifest problem never aborts a rebuild/sync.
 func reconcileManifest(repoDir *RepoDir, commit string) error {
+	var files []ManifestFile
+	// seenBlobs tracks blob filenames (sha256 hashes) already added so that the
+	// friendly-view walk does not double-count files found in the snapshot walk.
+	seenBlobs := make(map[string]bool)
+	// seenPaths tracks friendly-view-relative paths for regular (non-symlink)
+	// files so that neither phase adds the same path twice.
+	seenPaths := make(map[string]bool)
+
+	// ── Phase 1: hub snapshot directory ────────────────────────────────────
 	snapshotDir := repoDir.SnapshotDir(commit)
-	if _, err := os.Stat(snapshotDir); errors.Is(err, os.ErrNotExist) {
-		return nil
+	if _, err := os.Stat(snapshotDir); err == nil {
+		_ = filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				return nil
+			}
+			target, readErr := os.Readlink(path)
+			if readErr != nil {
+				return nil
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(path), target)
+			}
+			blobPath := filepath.Clean(target)
+			blobInfo, statErr := os.Stat(blobPath)
+			if statErr != nil {
+				// Blob doesn't exist on disk — skip this file.
+				return nil
+			}
+			relPath, relErr := filepath.Rel(snapshotDir, path)
+			if relErr != nil {
+				return nil
+			}
+			blobName := filepath.Base(blobPath)
+			seenBlobs[blobName] = true
+			seenPaths[relPath] = true
+			files = append(files, ManifestFile{
+				Name: relPath,
+				Blob: "blobs/" + blobName,
+				Size: blobInfo.Size(),
+			})
+			return nil
+		})
 	}
 
-	// Walk the snapshot and collect files whose blobs actually exist.
-	var files []ManifestFile
-	walkErr := filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
+	// ── Phase 2: friendly-view directory ───────────────────────────────────
+	// Walk the models/datasets directory so that files visible to the user but
+	// absent from the current snapshot (e.g. from an older snapshot whose
+	// symlinks still resolve, or files added by other tools) are also recorded.
+	friendlyPath := repoDir.FriendlyPath()
+	if _, statErr := os.Stat(friendlyPath); statErr == nil {
+		_ = filepath.Walk(friendlyPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			// Never include the manifest file itself.
+			if info.Name() == ManifestFilename {
+				return nil
+			}
+
+			relPath, relErr := filepath.Rel(friendlyPath, path)
+			if relErr != nil {
+				return nil
+			}
+
+			if info.Mode()&os.ModeSymlink != 0 {
+				// Follow the complete symlink chain (friendly → snapshot → blob).
+				realPath, evalErr := filepath.EvalSymlinks(path)
+				if evalErr != nil {
+					// Broken symlink — skip.
+					return nil
+				}
+				blobName := filepath.Base(realPath)
+				if seenBlobs[blobName] {
+					// Already recorded during the snapshot walk.
+					return nil
+				}
+				fileInfo, statErr := os.Stat(realPath)
+				if statErr != nil {
+					return nil
+				}
+				seenBlobs[blobName] = true
+				seenPaths[relPath] = true
+				files = append(files, ManifestFile{
+					Name: relPath,
+					Blob: "blobs/" + blobName,
+					Size: fileInfo.Size(),
+				})
+			} else {
+				// Regular (non-symlink) file placed directly in the friendly view.
+				if seenPaths[relPath] {
+					return nil
+				}
+				seenPaths[relPath] = true
+				files = append(files, ManifestFile{
+					Name: relPath,
+					Size: info.Size(),
+				})
+			}
 			return nil
-		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			return nil
-		}
-		target, readErr := os.Readlink(path)
-		if readErr != nil {
-			return nil
-		}
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(filepath.Dir(path), target)
-		}
-		blobPath := filepath.Clean(target)
-		blobInfo, statErr := os.Stat(blobPath)
-		if statErr != nil {
-			// Blob doesn't exist on disk — skip this file.
-			return nil
-		}
-		relPath, relErr := filepath.Rel(snapshotDir, path)
-		if relErr != nil {
-			return nil
-		}
-		files = append(files, ManifestFile{
-			Name: relPath,
-			Blob: "blobs/" + filepath.Base(blobPath),
-			Size: blobInfo.Size(),
 		})
-		return nil
-	})
-	if walkErr != nil {
-		return walkErr
+	}
+
+	// If neither the snapshot nor the friendly view exists there is nothing to
+	// reconcile.
+	if _, snapErr := os.Stat(snapshotDir); errors.Is(snapErr, os.ErrNotExist) {
+		if _, friendlyErr := os.Stat(friendlyPath); errors.Is(friendlyErr, os.ErrNotExist) {
+			return nil
+		}
 	}
 
 	// Read the existing manifest, if any.
-	friendlyPath := repoDir.FriendlyPath()
 	manifestPath := filepath.Join(friendlyPath, ManifestFilename)
 	existing, _ := ReadManifest(manifestPath)
 
