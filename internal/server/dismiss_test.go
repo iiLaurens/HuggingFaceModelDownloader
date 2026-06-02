@@ -13,8 +13,7 @@ import (
 
 // TestDismissJob_OnlyTerminalStates ensures DismissJob refuses to remove
 // jobs that are still queued or running — a user can't accidentally wipe
-// a live download by clicking the wrong button. Paused jobs are terminal
-// from the "visible in list" standpoint and can be dismissed.
+// a live download by clicking the wrong button.
 func TestDismissJob_OnlyTerminalStates(t *testing.T) {
 	m := NewJobManager(Config{}, nil)
 
@@ -24,7 +23,6 @@ func TestDismissJob_OnlyTerminalStates(t *testing.T) {
 	}{
 		{JobStatusQueued, false},
 		{JobStatusRunning, false},
-		{JobStatusPaused, true},
 		{JobStatusCompleted, true},
 		{JobStatusFailed, true},
 		{JobStatusCancelled, true},

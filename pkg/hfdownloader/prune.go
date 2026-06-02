@@ -18,7 +18,14 @@ type PruneResult struct {
 	TempRemoved       int
 	OrphanedRemoved   int
 	SpaceFreed        int64
+	DeletedFiles      []DeletedFile
 	Errors            []error
+}
+
+// DeletedFile records a single confirmed deletion.
+type DeletedFile struct {
+	Path string
+	Size int64
 }
 
 // Prune removes stale incomplete downloads, leftover temp files, and orphaned
@@ -59,7 +66,7 @@ func (c *HFCache) Prune() (*PruneResult, error) {
 			continue
 		}
 
-		inc, tmp, orph, freed, err := c.pruneRepo(repoDir)
+		inc, tmp, orph, freed, deleted, err := c.pruneRepo(repoDir)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("prune %s: %w", entry.Name(), err))
 			continue
@@ -69,26 +76,28 @@ func (c *HFCache) Prune() (*PruneResult, error) {
 		result.TempRemoved += tmp
 		result.OrphanedRemoved += orph
 		result.SpaceFreed += freed
+		result.DeletedFiles = append(result.DeletedFiles, deleted...)
 	}
 
 	return result, nil
 }
 
 // pruneRepo removes stale incomplete files, tmp-* files, and orphaned blobs for
-// a single repo.  Returns (incompleteRemoved, tempRemoved, orphanedRemoved, spaceFreed, error).
-func (c *HFCache) pruneRepo(repoDir *RepoDir) (int, int, int, int64, error) {
+// a single repo.  Returns (incompleteRemoved, tempRemoved, orphanedRemoved, spaceFreed, deletedFiles, error).
+func (c *HFCache) pruneRepo(repoDir *RepoDir) (int, int, int, int64, []DeletedFile, error) {
 	blobsDir := repoDir.BlobsDir()
 	if _, err := os.Stat(blobsDir); errors.Is(err, os.ErrNotExist) {
-		return 0, 0, 0, 0, nil
+		return 0, 0, 0, 0, nil, nil
 	}
 
 	entries, err := os.ReadDir(blobsDir)
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("read blobs dir: %w", err)
+		return 0, 0, 0, 0, nil, fmt.Errorf("read blobs dir: %w", err)
 	}
 
 	var incomplete, temp, orphaned int
 	var freed int64
+	var deleted []DeletedFile
 
 	// Step 1: Remove stale *.incomplete files (and their *.incomplete.meta companions).
 	for _, entry := range entries {
@@ -107,11 +116,14 @@ func (c *HFCache) pruneRepo(repoDir *RepoDir) (int, int, int, int64, error) {
 			continue
 		}
 		incPath := repoDir.IncompletePath(sha256)
+		var size int64
 		if info, statErr := os.Stat(incPath); statErr == nil {
-			freed += info.Size()
+			size = info.Size()
 		}
 		if removeErr := repoDir.CleanupIncomplete(sha256); removeErr == nil {
 			incomplete++
+			freed += size
+			deleted = append(deleted, DeletedFile{Path: incPath, Size: size})
 		}
 	}
 
@@ -128,11 +140,14 @@ func (c *HFCache) pruneRepo(repoDir *RepoDir) (int, int, int, int64, error) {
 			continue
 		}
 		tmpPath := filepath.Join(blobsDir, name)
+		var size int64
 		if info, statErr := os.Stat(tmpPath); statErr == nil {
-			freed += info.Size()
+			size = info.Size()
 		}
 		if removeErr := os.Remove(tmpPath); removeErr == nil {
 			temp++
+			freed += size
+			deleted = append(deleted, DeletedFile{Path: tmpPath, Size: size})
 		}
 	}
 
@@ -140,13 +155,13 @@ func (c *HFCache) pruneRepo(repoDir *RepoDir) (int, int, int, int64, error) {
 	// First build the set of referenced blob filenames.
 	referenced, walkErr := collectReferencedBlobs(repoDir.SnapshotsDir())
 	if walkErr != nil {
-		return incomplete, temp, 0, freed, fmt.Errorf("scan snapshots: %w", walkErr)
+		return incomplete, temp, 0, freed, deleted, fmt.Errorf("scan snapshots: %w", walkErr)
 	}
 
 	// Re-read the directory; steps 1 & 2 may have removed entries.
 	entries, err = os.ReadDir(blobsDir)
 	if err != nil {
-		return incomplete, temp, 0, freed, fmt.Errorf("re-read blobs dir: %w", err)
+		return incomplete, temp, 0, freed, deleted, fmt.Errorf("re-read blobs dir: %w", err)
 	}
 
 	for _, entry := range entries {
@@ -160,16 +175,19 @@ func (c *HFCache) pruneRepo(repoDir *RepoDir) (int, int, int, int64, error) {
 		}
 		if !referenced[name] {
 			blobPath := filepath.Join(blobsDir, name)
+			var size int64
 			if info, statErr := os.Stat(blobPath); statErr == nil {
-				freed += info.Size()
+				size = info.Size()
 			}
 			if removeErr := os.Remove(blobPath); removeErr == nil {
 				orphaned++
+				freed += size
+				deleted = append(deleted, DeletedFile{Path: blobPath, Size: size})
 			}
 		}
 	}
 
-	return incomplete, temp, orphaned, freed, nil
+	return incomplete, temp, orphaned, freed, deleted, nil
 }
 
 // collectReferencedBlobs walks the snapshots directory and returns the set of

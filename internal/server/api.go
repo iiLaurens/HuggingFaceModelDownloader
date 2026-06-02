@@ -301,45 +301,9 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handlePauseJob pauses a running job.
-func (s *Server) handlePauseJob(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		writeError(w, http.StatusBadRequest, "Missing job ID", "")
-		return
-	}
-
-	if s.jobs.PauseJob(id) {
-		writeJSON(w, http.StatusOK, SuccessResponse{
-			Success: true,
-			Message: "Job paused",
-		})
-	} else {
-		writeError(w, http.StatusNotFound, "Job not found or not running", "")
-	}
-}
-
-// handleResumeJob resumes a paused job.
-func (s *Server) handleResumeJob(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		writeError(w, http.StatusBadRequest, "Missing job ID", "")
-		return
-	}
-
-	if s.jobs.ResumeJob(id) {
-		writeJSON(w, http.StatusOK, SuccessResponse{
-			Success: true,
-			Message: "Job resumed",
-		})
-	} else {
-		writeError(w, http.StatusNotFound, "Job not found or not paused", "")
-	}
-}
-
 // handleDismissJob permanently removes a finished job from the list so it
 // doesn't reappear on page refresh (github issue #68 secondary ask). Only
-// jobs in terminal states (completed, failed, cancelled, paused) can be
+// jobs in terminal states (completed, failed, cancelled) can be
 // dismissed — active downloads must be cancelled first.
 func (s *Server) handleDismissJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -1295,15 +1259,23 @@ func humanSizeBytes(b int64) string {
 
 // PruneResponse represents the result of a cache prune operation.
 type PruneResponse struct {
-	Success           bool     `json:"success"`
-	ReposScanned      int      `json:"reposScanned"`
-	IncompleteRemoved int      `json:"incompleteRemoved"`
-	TempRemoved       int      `json:"tempRemoved"`
-	OrphanedRemoved   int      `json:"orphanedRemoved"`
-	SpaceFreed        int64    `json:"spaceFreed"`
-	SpaceFreedHuman   string   `json:"spaceFreedHuman"`
-	Errors            []string `json:"errors,omitempty"`
-	Message           string   `json:"message"`
+	Success           bool          `json:"success"`
+	ReposScanned      int           `json:"reposScanned"`
+	IncompleteRemoved int           `json:"incompleteRemoved"`
+	TempRemoved       int           `json:"tempRemoved"`
+	OrphanedRemoved   int           `json:"orphanedRemoved"`
+	SpaceFreed        int64         `json:"spaceFreed"`
+	SpaceFreedHuman   string        `json:"spaceFreedHuman"`
+	DeletedFiles      []PrunedFile  `json:"deletedFiles,omitempty"`
+	Errors            []string      `json:"errors,omitempty"`
+	Message           string        `json:"message"`
+}
+
+// PrunedFile describes a single file that was confirmed deleted during pruning.
+type PrunedFile struct {
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	SizeHuman string `json:"sizeHuman"`
 }
 
 // handleCachePrune removes stale incomplete downloads, leftover tmp-* files,
@@ -1336,6 +1308,13 @@ func (s *Server) handleCachePrune(w http.ResponseWriter, r *http.Request) {
 		OrphanedRemoved:   result.OrphanedRemoved,
 		SpaceFreed:        result.SpaceFreed,
 		SpaceFreedHuman:   humanSizeBytes(result.SpaceFreed),
+	}
+	for _, f := range result.DeletedFiles {
+		resp.DeletedFiles = append(resp.DeletedFiles, PrunedFile{
+			Path:      f.Path,
+			Size:      f.Size,
+			SizeHuman: humanSizeBytes(f.Size),
+		})
 	}
 	for _, e := range result.Errors {
 		resp.Errors = append(resp.Errors, e.Error())
