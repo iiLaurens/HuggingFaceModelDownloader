@@ -452,6 +452,14 @@ LOOP:
 		if _, err := manifest.Write(repoDir.FriendlyPath()); err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write manifest: %v", err)})
 		}
+		// Reconcile the manifest so that files from previous download sessions
+		// (e.g. files downloaded with a different filter or at a different
+		// revision) are merged in.  Without this step, the manifest written
+		// above would only contain the files downloaded in the current run,
+		// making earlier downloads invisible on the local-cache page.
+		if err := reconcileManifest(repoDir, plan.Commit); err != nil {
+			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to reconcile manifest: %v", err)})
+		}
 	}
 
 	emit(ProgressEvent{
