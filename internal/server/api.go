@@ -667,15 +667,10 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		stats.TotalSize += totalSize
 		stats.TotalFiles += fileCount
 
-		// Try to read commit from refs/main
-		branch := "main"
-		commit, _ := rd.ReadRef("main")
-		if commit == "" {
-			// Try other common refs
-			commit, _ = rd.ReadRef("master")
-			if commit != "" {
-				branch = "master"
-			}
+		// Try to read commit from ALL refs (prefer main/master)
+		commit, branch, _ := rd.ReadBestRef()
+		if branch == "" {
+			branch = "main"
 		}
 
 		// Get modification time from blobs dir
@@ -792,38 +787,71 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 	// Get snapshots
 	snapshots, _ := repoDir.ListSnapshots()
 
-	// Get size and file list by walking blobs directory
+	// Try to read commit and branch from ALL refs (prefer main/master).
+	// Do this before the file listing so we can order snapshots correctly.
+	commit, branch, _ := repoDir.ReadBestRef()
+	if branch == "" {
+		branch = "main"
+	}
+
+	// Get size and file list.
 	blobsDir := repoDir.BlobsDir()
 	var totalSize int64
 	var files []CachedFileInfo
 
-	// If we have snapshots, walk the latest one to get file names
 	if len(snapshots) > 0 {
-		// Use the first snapshot (usually the most recent)
-		snapshotDir := repoDir.SnapshotDir(snapshots[0])
-		filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
-				return nil
+		// Walk ALL snapshot directories, not just the first one.  Users often
+		// download different filters or revisions in separate sessions, each
+		// producing its own snapshot directory.  Showing only one snapshot
+		// silently drops all files from the other sessions.
+		//
+		// Order: current commit first so its version wins when the same
+		// relative path exists in multiple snapshots (updated files).
+		ordered := hfdownloader.OrderedSnapshotList(snapshots, commit)
+
+		// seenPaths deduplicates by relative path (current commit wins).
+		// seenBlobs prevents the same underlying blob from being counted twice
+		// when it happens to appear under different relative paths.
+		seenPaths := make(map[string]bool)
+		seenBlobs := make(map[string]bool)
+
+		for _, snapshotCommit := range ordered {
+			snapshotDir := repoDir.SnapshotDir(snapshotCommit)
+			if _, err := os.Stat(snapshotDir); os.IsNotExist(err) {
+				continue
 			}
-			// Get actual size by following symlink to blob
-			realPath, err := filepath.EvalSymlinks(path)
-			if err != nil {
+			filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
+				if err != nil || info.IsDir() {
+					return nil
+				}
+				// Resolve the full symlink chain to reach the actual blob.
+				realPath, err := filepath.EvalSymlinks(path)
+				if err != nil {
+					return nil
+				}
+				realInfo, err := os.Stat(realPath)
+				if err != nil {
+					return nil
+				}
+				relPath, _ := filepath.Rel(snapshotDir, path)
+				blobName := filepath.Base(realPath)
+
+				if seenPaths[relPath] || seenBlobs[blobName] {
+					return nil
+				}
+				seenPaths[relPath] = true
+				seenBlobs[blobName] = true
+
+				files = append(files, CachedFileInfo{
+					Name:      relPath,
+					Size:      realInfo.Size(),
+					SizeHuman: humanSizeBytes(realInfo.Size()),
+					IsLFS:     realInfo.Size() > 10*1024*1024,
+				})
+				totalSize += realInfo.Size()
 				return nil
-			}
-			realInfo, err := os.Stat(realPath)
-			if err != nil {
-				return nil
-			}
-			relPath, _ := filepath.Rel(snapshotDir, path)
-			files = append(files, CachedFileInfo{
-				Name:      relPath,
-				Size:      realInfo.Size(),
-				SizeHuman: humanSizeBytes(realInfo.Size()),
-				IsLFS:     realInfo.Size() > 10*1024*1024, // Assume >10MB is LFS
 			})
-			totalSize += realInfo.Size()
-			return nil
-		})
+		}
 	} else {
 		// No snapshots, just count blobs
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
@@ -838,16 +866,6 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		})
-	}
-
-	// Try to read commit and branch
-	branch := "main"
-	commit, _ := repoDir.ReadRef("main")
-	if commit == "" {
-		commit, _ = repoDir.ReadRef("master")
-		if commit != "" {
-			branch = "master"
-		}
 	}
 
 	// Try to read manifest

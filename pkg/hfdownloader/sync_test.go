@@ -360,3 +360,142 @@ func TestReconcileManifest_MultipleFilesIncluded(t *testing.T) {
 		t.Error("fileB.bin missing from manifest (picked up via friendly view)")
 	}
 }
+
+// TestReconcileManifest_MultipleSnapshotsAllFilesIncluded verifies that files
+// from two separate snapshot directories (each from a different download
+// session / filter) are both included via Phase 1 of reconcileManifest, even
+// when there are NO friendly-view symlinks and NO refs entry pointing at the
+// older snapshot.
+//
+// This is the core regression test for the "missing files" bug: user downloads
+// Q4_K_M with commit A, then Q8_0 with commit B.  refs/main → B.  Without
+// the fix, reconcileManifest only walked snapshot B and silently dropped the
+// Q4 file.
+func TestReconcileManifest_MultipleSnapshotsAllFilesIncluded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks require elevated privileges on Windows")
+	}
+
+	cache := setupTestCache(t)
+	repoDir, err := cache.Repo("owner/llama", RepoTypeModel)
+	if err != nil {
+		t.Fatalf("Repo: %v", err)
+	}
+	if err := repoDir.EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+	if err := repoDir.EnsureFriendlyDir(); err != nil {
+		t.Fatalf("EnsureFriendlyDir: %v", err)
+	}
+
+	const commitA = "aaaa1111"
+	const commitB = "bbbb2222"
+	const blobQ4 = "blobQ4aaaa"
+	const blobQ8 = "blobQ8bbbb"
+
+	// First session: Q4 file downloaded at commit A.
+	writeBlob(t, repoDir, blobQ4, "Q4 model data")
+	if err := repoDir.createSnapshotSymlink(commitA, "model.Q4_K_M.gguf", blobQ4); err != nil {
+		t.Fatalf("createSnapshotSymlink (A): %v", err)
+	}
+
+	// Second session: Q8 file downloaded at commit B.
+	writeBlob(t, repoDir, blobQ8, "Q8 model data")
+	if err := repoDir.createSnapshotSymlink(commitB, "model.Q8_0.gguf", blobQ8); err != nil {
+		t.Fatalf("createSnapshotSymlink (B): %v", err)
+	}
+
+	// refs/main now points only to the newer commit B.
+	if err := repoDir.WriteRef("main", commitB); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+
+	// No friendly-view symlinks are created: Phase 2 must NOT be needed.
+	// reconcileManifest is called with commit B (the current ref).
+	if err := reconcileManifest(repoDir, commitB); err != nil {
+		t.Fatalf("reconcileManifest: %v", err)
+	}
+
+	manifest, err := ReadManifest(filepath.Join(repoDir.FriendlyPath(), ManifestFilename))
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if len(manifest.Files) != 2 {
+		t.Fatalf("Files count = %d, want 2; files: %+v", len(manifest.Files), manifest.Files)
+	}
+	names := make(map[string]bool)
+	for _, f := range manifest.Files {
+		names[f.Name] = true
+	}
+	if !names["model.Q4_K_M.gguf"] {
+		t.Error("model.Q4_K_M.gguf missing from manifest (file from older snapshot)")
+	}
+	if !names["model.Q8_0.gguf"] {
+		t.Error("model.Q8_0.gguf missing from manifest (file from newer snapshot)")
+	}
+}
+
+// TestSyncRepoFriendlyView_MultipleSnapshots verifies that syncRepoFriendlyView
+// creates symlinks for files from ALL snapshot directories, not just the one
+// the current ref points to.
+func TestSyncRepoFriendlyView_MultipleSnapshots(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks require elevated privileges on Windows")
+	}
+
+	cache := setupTestCache(t)
+	repoDir, err := cache.Repo("owner/llama", RepoTypeModel)
+	if err != nil {
+		t.Fatalf("Repo: %v", err)
+	}
+	if err := repoDir.EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+	if err := repoDir.EnsureFriendlyDir(); err != nil {
+		t.Fatalf("EnsureFriendlyDir: %v", err)
+	}
+
+	const commitA = "aaaa3333"
+	const commitB = "bbbb4444"
+	const blobQ4 = "blobQ4cccc"
+	const blobQ8 = "blobQ8dddd"
+
+	// Session 1: Q4 file at commit A.
+	writeBlob(t, repoDir, blobQ4, "Q4 content")
+	if err := repoDir.createSnapshotSymlink(commitA, "model.Q4_K_M.gguf", blobQ4); err != nil {
+		t.Fatalf("createSnapshotSymlink (A): %v", err)
+	}
+
+	// Session 2: Q8 file at commit B.
+	writeBlob(t, repoDir, blobQ8, "Q8 content")
+	if err := repoDir.createSnapshotSymlink(commitB, "model.Q8_0.gguf", blobQ8); err != nil {
+		t.Fatalf("createSnapshotSymlink (B): %v", err)
+	}
+
+	// refs/main → commit B (newer session).
+	if err := repoDir.WriteRef("main", commitB); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+
+	created, _, err := cache.syncRepoFriendlyView(repoDir, SyncOptions{})
+	if err != nil {
+		t.Fatalf("syncRepoFriendlyView: %v", err)
+	}
+	// Both files should have been created (2 created, 0 updated).
+	if created != 2 {
+		t.Errorf("Created = %d, want 2", created)
+	}
+
+	// Verify both symlinks exist in the friendly view.
+	friendlyPath := repoDir.FriendlyPath()
+	for _, name := range []string{"model.Q4_K_M.gguf", "model.Q8_0.gguf"} {
+		linkPath := filepath.Join(friendlyPath, name)
+		if _, err := os.Lstat(linkPath); err != nil {
+			t.Errorf("friendly symlink %s missing: %v", name, err)
+		}
+		// Ensure the symlink resolves to an existing blob.
+		if _, err := os.Stat(linkPath); err != nil {
+			t.Errorf("friendly symlink %s does not resolve: %v", name, err)
+		}
+	}
+}

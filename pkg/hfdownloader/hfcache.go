@@ -503,6 +503,57 @@ func (r *RepoDir) ListSnapshots() ([]string, error) {
 	return commits, nil
 }
 
+// ListRefs returns the names of all refs stored in the refs/ directory.
+func (r *RepoDir) ListRefs() ([]string, error) {
+	entries, err := os.ReadDir(r.RefsDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var refs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			refs = append(refs, e.Name())
+		}
+	}
+	return refs, nil
+}
+
+// ReadBestRef returns the (commit, refName) for the best available ref.
+// It tries "main" and "master" first, then falls back to any other ref in
+// the refs/ directory.  Returns ("", "", nil) when no refs are present.
+func (r *RepoDir) ReadBestRef() (string, string, error) {
+	for _, ref := range []string{"main", "master"} {
+		commit, err := r.ReadRef(ref)
+		if err != nil {
+			return "", "", err
+		}
+		if commit != "" {
+			return commit, ref, nil
+		}
+	}
+	// Fall back to any available ref.
+	refs, err := r.ListRefs()
+	if err != nil {
+		return "", "", err
+	}
+	for _, ref := range refs {
+		if ref == "main" || ref == "master" {
+			continue // already tried
+		}
+		commit, err := r.ReadRef(ref)
+		if err != nil {
+			continue
+		}
+		if commit != "" {
+			return commit, ref, nil
+		}
+	}
+	return "", "", nil
+}
+
 // --- Friendly View Management ---
 
 // CreateFriendlySymlink creates a symlink in the friendly view pointing to a snapshot file.
